@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --config vite.config.ts",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview",
+    "preview": "vite preview --config vite.config.ts",
     "check": "tsc --noEmit",
     "cli": "tsx src/cli.ts",
     "mcp": "tsx src/mcp.ts",

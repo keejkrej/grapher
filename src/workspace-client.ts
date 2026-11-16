@@ -61,7 +61,12 @@ export function workspaceClient(baseUrl: string, activeDocumentId?: string) {
     return url.toString();
   }
   async function request(path: string, init?: RequestInit, signal?: AbortSignal) {
-    const response = await fetch(new URL(path, baseUrl), { ...init, signal });
+    const url = new URL(path, baseUrl);
+    const response = await fetch(url, { ...init, signal });
+    const type = mediaType(response);
+    if (type === 'text/html' || type === 'application/xhtml+xml') {
+      throw unavailable(url, `returned HTML (HTTP ${response.status})`);
+    }
     if (!response.ok) {
       const body = await response.json().catch(() => undefined);
       const message = typeof body?.error === 'string' ? body.error : response.statusText;
@@ -70,46 +75,70 @@ export function workspaceClient(baseUrl: string, activeDocumentId?: string) {
     return response;
   }
 
+  function mediaType(response: Response) {
+    return response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() || '';
+  }
+
+  function unavailable(url: URL, detail: string) {
+    return new Error(`Grapher workspace API is unavailable at ${url.origin}: ${url.pathname} ${detail}. Restart the Grapher workspace server and reload the app.`);
+  }
+
+  async function requestJson<T = Record<string, unknown>>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
+    const response = await request(path, init, signal);
+    const url = new URL(path, baseUrl);
+    const type = mediaType(response);
+    if (type !== 'application/json' && !type.endsWith('+json')) {
+      throw unavailable(url, `returned ${type || 'no Content-Type'} instead of JSON`);
+    }
+    const body = await response.text();
+    try {
+      return JSON.parse(body) as T;
+    } catch {
+      if (/^\s*(?:<!doctype\s+html\b|<html\b)/i.test(body)) throw unavailable(url, 'returned HTML instead of JSON');
+      throw new Error(`Grapher workspace API returned invalid JSON for ${url.pathname}. Restart the Grapher workspace server and reload the app.`);
+    }
+  }
+
   async function inspect(signal?: AbortSignal): Promise<Workspace> {
-    return (await request(targetPath('/api/scene'), undefined, signal)).json();
+    return requestJson(targetPath('/api/scene'), undefined, signal);
   }
 
   return {
     inspect,
     async documents(signal?: AbortSignal): Promise<{ documents: DocumentSummary[]; defaultDocumentId: string }> {
-      return (await request('/api/documents', undefined, signal)).json();
+      return requestJson('/api/documents', undefined, signal);
     },
     async create(input: z.infer<typeof createInput>, signal?: AbortSignal): Promise<Workspace> {
-      return (await request('/api/documents', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }, signal)).json();
+      return requestJson('/api/documents', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }, signal);
     },
     async history(signal?: AbortSignal): Promise<{ entries: HistoryEntry[] }> {
-      return (await request(targetPath('/api/history'), undefined, signal)).json();
+      return requestJson(targetPath('/api/history'), undefined, signal);
     },
     async restore(targetRevision: number, revision?: number, signal?: AbortSignal): Promise<Workspace> {
-      return (await request('/api/restore', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ documentId: activeDocumentId, targetRevision, revision }) }, signal)).json();
+      return requestJson('/api/restore', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ documentId: activeDocumentId, targetRevision, revision }) }, signal);
     },
     async compose(input: z.infer<typeof diagramInput>, signal?: AbortSignal): Promise<Workspace> {
-      return (await request('/api/diagram', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...input, documentId: input.documentId ?? activeDocumentId }) }, signal)).json();
+      return requestJson('/api/diagram', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...input, documentId: input.documentId ?? activeDocumentId }) }, signal);
     },
     async plot(input: z.infer<typeof plotInput>, signal?: AbortSignal): Promise<Workspace> {
-      return (await request('/api/plot', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...input, documentId: input.documentId ?? activeDocumentId }) }, signal)).json();
+      return requestJson('/api/plot', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...input, documentId: input.documentId ?? activeDocumentId }) }, signal);
     },
     async capabilities(signal?: AbortSignal) {
-      return (await request('/api/capabilities', undefined, signal)).json();
+      return requestJson('/api/capabilities', undefined, signal);
     },
     async verify(signal?: AbortSignal) {
       const { documentId, revision, report } = await inspect(signal);
       return { documentId, revision, ...report };
     },
     async edit(edit: Edit, signal?: AbortSignal): Promise<Workspace> {
-      return (await request('/api/scene', {
+      return requestJson('/api/scene', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ ...edit, documentId: edit.documentId ?? activeDocumentId }),
-      }, signal)).json();
+      }, signal);
     },
     export(format: ExportFormat, revision?: number, signal?: AbortSignal, options: { scale?: number; outlineText?: boolean } = {}) {
       const params = new URLSearchParams({ format });
