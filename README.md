@@ -25,17 +25,19 @@ Documents and their complete revision history persist in `.grapher/workspace.sql
 | Interaction | Behavior |
 | --- | --- |
 | Click and drag an element | Move it with a live preview; release to save one edit. Escape cancels. |
-| Double-click text | Edit its actual text source. Enter saves, Shift+Enter adds a line, Escape cancels. |
-| Right-click an element | Edit text, duplicate, change stacking order, delete, or ask the agent about the selection. Shift+F10 also opens actions. |
+| Double-click text | Edit in place using the artwork's typography. Enter adds a line; click outside or Ctrl/Cmd+Enter finishes; Escape cancels. Clearing the text removes the layer. |
+| Right-click an element | Edit text, duplicate, change stacking order, or delete. Shift+F10 also opens actions. |
 | Drag a corner handle | Resize; Shift preserves proportions. Text scales proportionally. Reset rotation before resizing a rotated layer. |
 | Arrow keys / Shift+arrow | Nudge by 1 / 10 scene pixels. |
 | Ctrl/Cmd+D; Delete | Duplicate or delete the selected element. Text fields keep their normal keyboard behavior. |
 | Ctrl/Cmd+Z; Ctrl/Cmd+Shift+Z | Undo or redo local edits. History includes saved agent changes too. |
 | Inspector | Edit exact position, dimensions, text size, content and colors. |
 
-The console shows the selected element as request context. **Ask agent about selection** opens it with that focus, and the server validates the selection against the target document. People can make precise corrections and hand the same editable artifact back to an agent.
+Agents access the same documents through MCP, WebMCP, or the CLI, including from external clients such as Claude Code. Human corrections need no in-app agent handoff. The optional console includes the selected element as request context, validated against the active document.
 
 ![Direct editing and selection actions](docs/assets/human-editing.png)
+
+![Editing text directly on the artwork](docs/assets/inline-text-editing.png)
 
 Human gestures and agent tools share the revision system. A concurrent edit cannot silently overwrite newer work. Rejected text saves retain the draft; if another revision conflicts, the editor keeps a copyable draft. Original generator inputs remain a provenance snapshot after manual changes. Direct manipulation currently focuses on individual layers; grouping and multiple selection are not implemented.
 

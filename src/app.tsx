@@ -2,7 +2,7 @@ import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
 import type { UIMessage } from 'ai';
 import { Button } from '@ui-sdk/react/button';
-import { Menu, MenuContent, MenuContextTrigger, MenuGroup, MenuGroupLabel, MenuItem, MenuSeparator, MenuTrigger } from '@ui-sdk/react/menu';
+import { Menu, MenuContent, MenuContextTrigger, MenuGroup, MenuGroupLabel, MenuItem, MenuTrigger } from '@ui-sdk/react/menu';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@ui-sdk/react/tabs';
 import {
   ArrowDownToLine, ArrowUp, Box, Braces, Check, ChevronDown, Circle, CircleAlert, CircleCheck, CodeXml, Crosshair,
@@ -15,6 +15,8 @@ import { layerBounds, sceneSvg, verifyScene } from './engine';
 import type { Layer, Operation, Scene } from './engine';
 import { duplicateLayers } from './interaction';
 import { isTextInput, useCanvasInteractions } from './use-canvas-interactions';
+import { CanvasTextEditor } from './canvas-text-editor';
+import { CanvasContextMenu } from './canvas-context-menu';
 import { examples, initialExample } from './examples';
 import { useGrapherTools } from './webmcp';
 import { workspaceClient } from './workspace-client';
@@ -167,7 +169,8 @@ export function App() {
   const stage = useRef<HTMLDivElement>(null);
   const feed = useRef<HTMLDivElement>(null);
   const consoleInput = useRef<HTMLTextAreaElement>(null);
-  const textInput = useRef<HTMLTextAreaElement>(null);
+  const finishingTextClick = useRef<Promise<boolean> | undefined>(undefined);
+  const composingText = useRef(false);
   const artboard = useRef<HTMLDivElement>(null);
   const keyboardMenuAnchor = useRef<HTMLSpanElement>(null);
   const drag = useRef<{ x: number; y: number } | undefined>(undefined);
@@ -250,13 +253,12 @@ export function App() {
   });
   const preview = interaction.preview && interaction.preview.documentId === documentId ? interaction.preview.layer : undefined;
   const displayScene = useMemo(() => preview ? { ...scene, layers: scene.layers.map((layer) => layer.id === preview.id ? preview : layer) } : scene, [scene, preview]);
-  const art = useMemo(() => sceneSvg(displayScene, { outlineText: true }), [displayScene]);
+  const editedLayerId = interaction.editing?.layer.id;
+  const art = useMemo(() => sceneSvg(editedLayerId ? {
+    ...displayScene, layers: displayScene.layers.map((layer) => layer.id === editedLayerId ? { ...layer, visible: false } : layer),
+  } : displayScene, { outlineText: true }), [displayScene, editedLayerId]);
   const shownSelection = preview?.id === selected ? preview : selectedLayer;
   const bounds = shownSelection?.visible ? layerBounds(shownSelection) : undefined;
-
-  useEffect(() => {
-    if (interaction.editing) { textInput.current?.focus(); textInput.current?.select(); }
-  }, [interaction.editing?.layer.id]);
 
   useEffect(() => {
     if (!hasMesh && mode === 'mesh') setMode('canvas');
@@ -496,9 +498,20 @@ export function App() {
   }
 
   function canvasDoubleClick(event: MouseEvent<HTMLDivElement>) {
-    if (tool !== 'select') return;
+    if (tool !== 'select' || isTextInput(event.target)) return;
     const layer = layerAt(event.target) ?? layerAt(document.elementFromPoint(event.clientX, event.clientY));
-    if (layer?.kind === 'text') { event.preventDefault(); interaction.beginText(layer); }
+    if (layer?.kind === 'text') { event.preventDefault(); interaction.beginText(layer, { x: event.clientX, y: event.clientY }); }
+  }
+
+  async function finishText(target?: Element) {
+    if (composingText.current) return false;
+    if (!await interaction.saveText()) {
+      artboard.current?.querySelector<HTMLTextAreaElement>('.canvas-text-editor textarea')?.focus({ preventScroll: true });
+      return false;
+    }
+    if (target?.closest('.stage')) setSelected(layerAt(target)?.id);
+    artboard.current?.focus({ preventScroll: true });
+    return true;
   }
 
   async function deleteSelection() {
@@ -525,9 +538,6 @@ export function App() {
     else if (action === 'front' || action === 'back') {
       const operation: Operation = { op: 'reorder', id: selectedLayer.id, index: action === 'front' ? scene.layers.length - 1 : 0 };
       await mutate({ action: 'apply', operations: [operation] });
-    } else if (action === 'agent') {
-      setConsoleOpen(true);
-      window.requestAnimationFrame(() => consoleInput.current?.focus());
     }
   }
 
@@ -560,7 +570,25 @@ export function App() {
       <SampleLabel sampleKey={key} name={name} active={false} />
     </Button>);
 
-  return <div className="studio">
+  return <div className="studio" onPointerDownCapture={(event) => {
+    finishingTextClick.current = undefined;
+    if (!interaction.editing || (event.target as Element).closest('[data-canvas-editor]')) return;
+    event.preventDefault(); event.stopPropagation();
+    const finished = finishText(event.target as Element);
+    if (event.button === 0) finishingTextClick.current = finished;
+  }} onClickCapture={(event) => {
+    if (finishingTextClick.current) {
+      const finished = finishingTextClick.current;
+      finishingTextClick.current = undefined;
+      event.preventDefault(); event.stopPropagation();
+      const control = (event.target as Element).closest<HTMLElement>('button, a, input, select, textarea');
+      if (control && !control.closest('.artboard')) void finished.then((saved) => {
+        if (!saved || !control.isConnected) return;
+        control.focus({ preventScroll: true });
+        if (control.matches('button, a')) control.click();
+      });
+    }
+  }}>
     <header className="app-header">
       <div className="header-left">
         <div className="brand"><BrandMark /><span>Grapher</span></div>
@@ -690,11 +718,11 @@ export function App() {
                   if (isTextInput(event.target)) { event.stopPropagation(); return; }
                   const layer = layerAt(event.target);
                   if (layer) { setSelected(layer.id); setInspector('properties'); }
-                  else if (event.clientX || event.clientY) setSelected(undefined);
+                  else if ((event.clientX || event.clientY) && !(event.target as Element).closest('[data-resize-handle]')) setSelected(undefined);
                 }}>
                 <div className="artwork" dangerouslySetInnerHTML={{ __html: art }} />
                 <span ref={keyboardMenuAnchor} className="keyboard-menu-anchor" aria-hidden="true" />
-                {bounds && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }}>
+                {bounds && !interaction.editing && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }}>
                   {!interaction.editing && !selectedLayer?.rotationDeg && tool === 'select' && (['nw', 'ne', 'se', 'sw'] as const).map((corner) =>
                     <button key={corner} type="button" className={`resize-handle handle-${corner}`} data-resize-handle={corner}
                       aria-label={`Resize ${corner === 'nw' ? 'top left' : corner === 'ne' ? 'top right' : corner === 'se' ? 'bottom right' : 'bottom left'}`}
@@ -702,34 +730,12 @@ export function App() {
                         event.stopPropagation(); if (selectedLayer) interaction.begin(event, selectedLayer, corner);
                       }} />)}
                 </div>}
-                {interaction.editing && <div className="canvas-text-editor" data-canvas-editor="true" role="group" aria-label="Canvas text editor"
-                  style={{ left: Math.max(0, Math.min((bounds?.x ?? 0) * scale, scene.width * scale - 250)),
-                    top: Math.max(0, Math.min((bounds?.y ?? 0) * scale, scene.height * scale - 160)) }}>
-                  <textarea ref={textInput} aria-label="Edit text on canvas" maxLength={10000} value={interaction.editing.value}
-                    disabled={working} onChange={(event) => interaction.changeText(event.target.value)} onKeyDown={(event) => {
-                      event.stopPropagation();
-                      if (event.key === 'Escape') { event.preventDefault(); interaction.cancel(); artboard.current?.focus(); }
-                      if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                        event.preventDefault(); void interaction.saveText().then((saved) => { if (saved) artboard.current?.focus(); });
-                      }
-                    }} />
-                  <div><small>{interaction.editing.conflict ? 'Document changed. Copy your draft, then cancel and reopen.' : 'Enter saves · Shift + Enter adds a line'}</small><span>
-                    <Button type="button" disabled={working} onClick={() => { interaction.cancel(); artboard.current?.focus(); }}>Cancel</Button>
-                    <Button type="button" disabled={working || interaction.editing.conflict} onClick={() => void interaction.saveText().then((saved) => { if (saved) artboard.current?.focus(); })}>Save</Button>
-                  </span></div>
-                </div>}
+                {interaction.editing && <CanvasTextEditor key={interaction.editing.layer.id} edit={interaction.editing} scale={scale}
+                  saving={interaction.textSaving} onChange={interaction.changeText} onFinish={() => void finishText()}
+                  onCompositionChange={(active) => { composingText.current = active; }}
+                  onCancel={() => { interaction.cancel(); artboard.current?.focus(); }} />}
               </MenuContextTrigger>
-              <MenuContent className="pop-menu canvas-context-menu" aria-label="Selection actions"
-                side="bottom" align="start" sideOffset={4} collisionPadding={12} finalFocus={() => artboard.current}>
-                <div className="menu-caption">{selectedLayer?.name ?? 'Select an element'}</div>
-                <MenuItem value="text" label="Edit text" disabled={working || selectedLayer?.kind !== 'text'}><Type size={14} /> Edit text</MenuItem>
-                <MenuItem value="duplicate" label="Duplicate" shortcut="mod+d" disabled={working || !selectedLayer}><Copy size={14} /> Duplicate</MenuItem>
-                <MenuItem value="front" label="Bring to front" disabled={working || !selectedLayer}>Bring to front</MenuItem>
-                <MenuItem value="back" label="Send to back" disabled={working || !selectedLayer}>Send to back</MenuItem>
-                <MenuSeparator className="context-separator" />
-                <MenuItem value="agent" label="Ask agent about selection" disabled={!selectedLayer}><Sparkles size={14} /> Ask agent about selection</MenuItem>
-                <MenuItem value="delete" label="Delete" shortcut="Delete" destructive disabled={working || !selectedLayer}>Delete</MenuItem>
-              </MenuContent>
+              <CanvasContextMenu selectedLayer={selectedLayer} working={working} finalFocus={() => artboard.current} />
             </Menu>
           </div>}
           {mode === 'mesh' && <Suspense fallback={<div className="view-loading">Opening 3D view…</div>}><MeshPreview scene={scene} /></Suspense>}
@@ -737,7 +743,13 @@ export function App() {
             <div><strong>Scene source</strong><button onClick={() => void exportScene('json')}><ArrowDownToLine size={14} /> Download JSON</button></div>
             <pre>{JSON.stringify(scene, null, 2)}</pre>
           </div>}
-          {mode === 'canvas' && <div className="zoom-widget">
+          {interaction.editing && <div className="text-edit-controls" data-canvas-editor="true" role="group" aria-label="Text editing">
+            <span id="text-edit-help">{interaction.editing.conflict ? 'Document changed. Your draft is kept—copy it before cancelling.'
+              : interaction.textSaving ? 'Saving…' : 'Click outside to finish · Ctrl/⌘ + Enter · Esc to cancel'}</span>
+            <Button disabled={interaction.textSaving} onClick={() => { interaction.cancel(); artboard.current?.focus(); }}>Cancel</Button>
+            <Button className="text-edit-done" disabled={interaction.textSaving || interaction.editing.conflict} onClick={() => void finishText()}>Done</Button>
+          </div>}
+          {mode === 'canvas' && !interaction.editing && <div className="zoom-widget">
             <IconButton label="Zoom out" onClick={() => setZoom((value) => Math.max(0.25, value / 1.2))}><Minus size={15} /></IconButton>
             <button className="zoom-value" onClick={fitCanvas} title="Reset zoom">{Math.round(scale * 100)}%</button>
             <IconButton label="Zoom in" onClick={() => setZoom((value) => Math.min(4, value * 1.2))}><Plus size={15} /></IconButton>

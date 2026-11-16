@@ -18,7 +18,7 @@ type Gesture = {
   pointerId?: number;
   moved: boolean;
 };
-export type TextEdit = { base: Workspace; layer: TextLayer; value: string; conflict?: boolean };
+export type TextEdit = { base: Workspace; layer: TextLayer; value: string; point?: { x: number; y: number }; conflict?: boolean };
 
 type Options = {
   workspace: Workspace;
@@ -45,13 +45,15 @@ export function useCanvasInteractions(options: Options) {
   const gesture = useRef<Gesture | undefined>(undefined);
   const editor = useRef<TextEdit | undefined>(undefined);
   const saving = useRef(false);
+  const textSaveInFlight = useRef(false);
   const savingLayer = useRef<Layer | undefined>(undefined);
   const pendingNudge = useRef<{ documentId?: string; id: string; x: number; y: number } | undefined>(undefined);
   const pressedArrows = useRef(new Set<string>());
   const [preview, setPreview] = useState<{ documentId?: string; layer: Layer }>();
   const [editing, setEditing] = useState<TextEdit>();
+  const [textSaving, setTextSaving] = useState(false);
 
-  function cancel() {
+  function clearInteraction() {
     const active = !!gesture.current || !!editor.current;
     gesture.current = undefined;
     pendingNudge.current = undefined;
@@ -60,6 +62,13 @@ export function useCanvasInteractions(options: Options) {
     setPreview(undefined);
     setEditing(undefined);
     return active;
+  }
+
+  function cancel() {
+    // A submitted save cannot be undone by closing the editor. Keep its state visible
+    // until it settles; a subsequent scene undo can reverse a successful save.
+    if (textSaveInFlight.current) return false;
+    return clearInteraction();
   }
 
   async function finish() {
@@ -150,17 +159,19 @@ export function useCanvasInteractions(options: Options) {
     }
   }
 
-  function beginText(layer: Layer) {
-    if (layer.kind !== 'text' || !current.current.enabled || saving.current) return;
+  function beginText(layer: Layer, point?: { x: number; y: number }) {
+    // A native double-click within the editor selects a word; it must not reset
+    // the draft. The caller saves or cancels before switching to another layer.
+    if (layer.kind !== 'text' || !current.current.enabled || saving.current || editor.current) return;
     cancel();
     current.current.select(layer.id);
-    const next = { base: current.current.workspace, layer, value: layer.text };
+    const next = { base: current.current.workspace, layer, value: layer.text, point };
     editor.current = next;
     setEditing(next);
   }
 
   function changeText(value: string) {
-    if (!editor.current) return;
+    if (!editor.current || textSaveInFlight.current) return;
     const next = { ...editor.current, value };
     editor.current = next;
     setEditing(next);
@@ -170,22 +181,32 @@ export function useCanvasInteractions(options: Options) {
     const edit = editor.current;
     if (!edit || saving.current || edit.conflict) return false;
     saving.current = true;
+    textSaveInFlight.current = true;
+    setTextSaving(true);
     let saved = false;
     try {
-      saved = edit.value === edit.layer.text || !!await current.current.commit([
-        layerUpdate(edit.layer, { ...edit.layer, text: edit.value }),
-      ], edit.base);
+      const operation: Operation = edit.value.trim()
+        ? layerUpdate(edit.layer, { ...edit.layer, text: edit.value })
+        : { op: 'remove', id: edit.layer.id };
+      saved = edit.value === edit.layer.text || !!await current.current.commit([operation], edit.base);
     } catch (error) { current.current.notify(error instanceof Error ? error.message : String(error)); }
     finally {
       saving.current = false;
-      if (saved) { editor.current = undefined; setEditing(undefined); }
-      else if (editor.current && edit.base.documentId === current.current.workspace.documentId && edit.base.revision !== current.current.workspace.revision) {
-        const next = { ...editor.current, conflict: true };
+      textSaveInFlight.current = false;
+      setTextSaving(false);
+      const sameEditor = editor.current === edit;
+      const sameDocument = edit.base.documentId === current.current.workspace.documentId;
+      if (saved && sameEditor && sameDocument) {
+        editor.current = undefined;
+        setEditing(undefined);
+        if (!edit.value.trim() && current.current.selected === edit.layer.id) current.current.select(undefined);
+      } else if (sameEditor && sameDocument && edit.base.revision !== current.current.workspace.revision) {
+        const next = { ...edit, conflict: true };
         editor.current = next;
         setEditing(next);
       }
     }
-    return saved;
+    return saved && edit.base.documentId === current.current.workspace.documentId;
   }
 
   useEffect(() => {
@@ -198,7 +219,9 @@ export function useCanvasInteractions(options: Options) {
         setEditing(next);
         current.current.notify('The document changed. Your text draft is kept; copy it before closing the editor.');
       } else {
-        cancel();
+        // Switching documents changes the displayed scope even when the previous
+        // document's request is pending. Its completion must not close a new draft.
+        clearInteraction();
         if (active.documentId === options.workspace.documentId) current.current.notify('The document changed. Your unfinished move was cancelled; the latest revision is shown.');
       }
     }
@@ -215,7 +238,10 @@ export function useCanvasInteractions(options: Options) {
   useEffect(() => {
     function keydown(event: KeyboardEvent) {
       if (event.defaultPrevented || isTextInput(event.target) || (event.target instanceof Element && event.target.closest('[role="menu"], [role="dialog"]'))) return;
-      if (event.key === 'Escape') { if (!cancel()) current.current.select(undefined); return; }
+      if (event.key === 'Escape') {
+        if (!textSaveInFlight.current && !cancel()) current.current.select(undefined);
+        return;
+      }
       if (editor.current || (event.target instanceof Element && event.target.closest('[data-canvas-editor]'))) return;
       const state = current.current;
       const modifier = event.ctrlKey || event.metaKey;
@@ -266,6 +292,6 @@ export function useCanvasInteractions(options: Options) {
     };
   }, []);
 
-  return { preview, editing, begin, move, finish, cancel, beginText, changeText, saveText,
+  return { preview, editing, textSaving, begin, move, finish, cancel, beginText, changeText, saveText,
     release: () => { if (gesture.current) cancel(); } };
 }
