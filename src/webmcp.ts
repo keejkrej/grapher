@@ -1,34 +1,81 @@
 import { useWebMCP } from 'use-webmcp-tool';
 import { z } from 'zod';
-import { applyInput, exportInput, repairInput, replaceInput, workspaceClient, workspaceTools, type Workspace } from './workspace-client';
+import { applyInput, createInput, diagramInput, exportInput, plotInput, repairInput, replaceInput, restoreInput, targetInput, workspaceClient, workspaceTools, type Workspace } from './workspace-client';
 
-const inspectSchema = { type: 'object', properties: {}, additionalProperties: false };
+const emptySchema = { type: 'object', properties: {}, additionalProperties: false };
+const inspectSchema = z.toJSONSchema(targetInput, { io: 'input' });
 const applySchema = z.toJSONSchema(applyInput, { io: 'input' });
 const replaceSchema = z.toJSONSchema(replaceInput, { io: 'input' });
 const repairSchema = z.toJSONSchema(repairInput, { io: 'input' });
 const exportSchema = z.toJSONSchema(exportInput, { io: 'input' });
+const createSchema = z.toJSONSchema(createInput, { io: 'input' });
+const diagramJsonSchema = z.toJSONSchema(diagramInput, { io: 'input' });
+const plotJsonSchema = z.toJSONSchema(plotInput, { io: 'input' });
+const restoreSchema = z.toJSONSchema(restoreInput, { io: 'input' });
 const sceneOutput = { untrustedContentHint: true };
 const readOnly = { ...sceneOutput, readOnlyHint: true };
 
-export function useGrapherTools(onChange?: (workspace: Workspace) => void) {
+export function useGrapherTools(onChange?: (workspace: Workspace) => void, activeDocumentId?: string) {
+  function client(documentId = activeDocumentId) { return workspaceClient(location.origin, documentId); }
+  async function changed(result: Promise<Workspace>) {
+    const workspace = await result;
+    onChange?.(workspace);
+    return workspace;
+  }
   async function edit(request: Parameters<ReturnType<typeof workspaceClient>['edit']>[0], signal?: AbortSignal) {
-    const result = await workspaceClient(location.origin).edit(request, signal);
-    onChange?.(result);
-    return result;
+    return changed(client(request.documentId).edit(request, signal));
   }
 
   const inspect = useWebMCP({
     ...workspaceTools.inspect,
     inputSchema: inspectSchema,
     annotations: readOnly,
-    execute: (_, options) => workspaceClient(location.origin).inspect(options?.signal),
+    execute: (args, options) => client(targetInput.parse(args).documentId).inspect(options?.signal),
   });
 
   useWebMCP({
     ...workspaceTools.verify,
     inputSchema: inspectSchema,
     annotations: readOnly,
-    execute: (_, options) => workspaceClient(location.origin).verify(options?.signal),
+    execute: (args, options) => client(targetInput.parse(args).documentId).verify(options?.signal),
+  });
+
+  useWebMCP({
+    ...workspaceTools.documents, inputSchema: emptySchema, annotations: readOnly,
+    execute: (_, options) => client().documents(options?.signal),
+  });
+  useWebMCP({
+    ...workspaceTools.capabilities, inputSchema: emptySchema, annotations: readOnly,
+    execute: (_, options) => client().capabilities(options?.signal),
+  });
+  useWebMCP({
+    ...workspaceTools.history, inputSchema: inspectSchema, annotations: readOnly,
+    execute: (args, options) => client(targetInput.parse(args).documentId).history(options?.signal),
+  });
+  useWebMCP({
+    ...workspaceTools.create, inputSchema: createSchema, annotations: sceneOutput,
+    execute: (args, options) => changed(client().create(createInput.parse(args), options?.signal)),
+  });
+  useWebMCP({
+    ...workspaceTools.restore, inputSchema: restoreSchema, annotations: sceneOutput,
+    execute: (args, options) => {
+      const input = restoreInput.parse(args);
+      return changed(client(input.documentId).restore(input.targetRevision, input.revision, options?.signal));
+    },
+  });
+  useWebMCP({
+    ...workspaceTools.compose, inputSchema: diagramJsonSchema, annotations: sceneOutput,
+    execute: (args, options) => {
+      const input = diagramInput.parse(args);
+      return changed(client(input.documentId).compose(input, options?.signal));
+    },
+  });
+  useWebMCP({
+    ...workspaceTools.plot, inputSchema: plotJsonSchema, annotations: sceneOutput,
+    execute: (args, options) => {
+      const input = plotInput.parse(args);
+      return changed(client(input.documentId).plot(input, options?.signal));
+    },
   });
 
   useWebMCP({
@@ -57,10 +104,10 @@ export function useGrapherTools(onChange?: (workspace: Workspace) => void) {
     inputSchema: exportSchema,
     annotations: readOnly,
     async execute(args, options) {
-      const { format, revision: expected } = exportInput.parse(args);
-      const response = await workspaceClient(location.origin).export(format, expected, options?.signal);
+      const { format, revision: expected, documentId, scale, outlineText } = exportInput.parse(args);
+      const response = await client(documentId).export(format, expected, options?.signal, { scale, outlineText });
       const revision = response.headers.get('x-grapher-revision');
-      const description = { type: 'text', text: JSON.stringify({ format, revision }) };
+      const description = { type: 'text', text: JSON.stringify({ format, revision, documentId: response.headers.get('x-grapher-document') }) };
       if (format === 'svg' || format === 'json') {
         return { content: [description, { type: 'text', text: await response.text() }] };
       }
@@ -77,7 +124,7 @@ export function useGrapherTools(onChange?: (workspace: Workspace) => void) {
       }
       return { content: [description, {
         type: 'resource',
-        resource: { uri: response.url, mimeType: 'model/gltf-binary', blob: data },
+        resource: { uri: response.url, mimeType: format === 'pdf' ? 'application/pdf' : 'model/gltf-binary', blob: data },
       }] };
     },
   });

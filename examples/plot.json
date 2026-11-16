@@ -1,0 +1,23 @@
+{
+  "kind": "line",
+  "title": "Synthetic response example",
+  "xLabel": "Time",
+  "xUnit": "h",
+  "yLabel": "Response",
+  "yUnit": "a.u.",
+  "caption": "Synthetic values for demonstration. Intervals are supplied values, not calculated confidence intervals.",
+  "source": "Grapher example data; replace with your observations.",
+  "series": [
+    {
+      "id": "sample",
+      "name": "Example series",
+      "points": [
+        { "x": 0, "y": 4, "yLow": 2, "yHigh": 6 },
+        { "x": 2, "y": 19, "yLow": 15, "yHigh": 23 },
+        { "x": 4, "y": 35, "yLow": 30, "yHigh": 40 },
+        { "x": 8, "y": 51, "yLow": 46, "yHigh": 56 },
+        { "x": 12, "y": 54, "yLow": 49, "yHigh": 59 }
+      ]
+    }
+  ]
+}
