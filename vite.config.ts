@@ -10,10 +10,14 @@ export default defineConfig(({ mode }) => {
       {
         name: 'grapher-workspace',
         configureServer(server) {
-          server.middlewares.use(workspaceMiddleware(env));
+          const workspace = workspaceMiddleware(env);
+          server.middlewares.use(workspace);
+          server.httpServer?.once('close', () => workspace.close());
         },
         configurePreviewServer(server) {
-          server.middlewares.use(workspaceMiddleware(env));
+          const workspace = workspaceMiddleware(env);
+          server.middlewares.use(workspace);
+          server.httpServer.once('close', () => workspace.close());
         },
       },
     ],

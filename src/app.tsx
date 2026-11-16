@@ -2,23 +2,27 @@ import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
 import type { UIMessage } from 'ai';
 import { Button } from '@ui-sdk/react/button';
-import { Menu, MenuContent, MenuGroup, MenuGroupLabel, MenuItem, MenuTrigger } from '@ui-sdk/react/menu';
+import { Menu, MenuContent, MenuContextTrigger, MenuGroup, MenuGroupLabel, MenuItem, MenuTrigger } from '@ui-sdk/react/menu';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@ui-sdk/react/tabs';
 import {
   ArrowDownToLine, ArrowUp, Box, Braces, Check, ChevronDown, Circle, CircleAlert, CircleCheck, CodeXml, Crosshair,
-  Eye, EyeOff, Focus, Hand, Image, Layers3, Minus, MousePointer2, Orbit, Plus, Redo2, RotateCw, ScanLine, Shapes,
+  Copy, Eye, EyeOff, FilePlus2, FileUp, Focus, Hand, History, Image, Layers3, Minus, MousePointer2, Orbit, Plus, Redo2, RotateCw, ScanLine, Shapes,
   Sparkles, Square, SquareTerminal, Type, Undo2, X,
 } from 'lucide-react';
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, PointerEvent, ReactNode } from 'react';
 import { layerBounds, sceneSvg, verifyScene } from './engine';
-import type { Layer, Scene } from './engine';
+import type { Layer, Operation, Scene } from './engine';
+import { duplicateLayers } from './interaction';
+import { isTextInput, useCanvasInteractions } from './use-canvas-interactions';
+import { CanvasTextEditor } from './canvas-text-editor';
+import { CanvasContextMenu } from './canvas-context-menu';
 import { examples, initialExample } from './examples';
 import { useGrapherTools } from './webmcp';
 import { workspaceClient } from './workspace-client';
 import type { ExportFormat, Workspace } from './workspace-client';
+import type { DocumentSummary, HistoryEntry } from './store';
 
-const client = workspaceClient(location.origin);
 const transport = new DefaultChatTransport({
   api: '/api/chat',
   prepareSendMessagesRequest: ({ body, messages }) => ({
@@ -40,17 +44,43 @@ const sampleAppearance = {
   web: { icon: CodeXml, tone: 'violet' },
   game: { icon: Box, tone: 'green' },
   poster: { icon: Type, tone: 'rose' },
+  'single-cell-workflow': { icon: Shapes, tone: 'green' },
+  'causal-pathways': { icon: Orbit, tone: 'violet' },
+  'response-curve': { icon: Shapes, tone: 'orange' },
 };
+const samples = [
+  { key: 'single-cell-workflow', name: 'Single-cell RNA-seq analysis' },
+  { key: 'causal-pathways', name: 'Causal pathways and confounding' },
+  { key: 'response-curve', name: 'Response curve · synthetic example' },
+  ...Object.entries(examples).map(([key, scene]) => ({ key, name: scene.name })),
+];
 const issueTitles: Record<string, string> = {
   bounds: 'Layer outside canvas', contrast: 'Low text contrast', labels: 'Missing label', assets: 'Invalid raster asset',
   geometry: 'Invalid layer geometry', unique: 'Duplicate layer ID', canvas: 'Invalid artboard', visibility: 'Empty canvas',
+  fonts: 'Typography needs review', decode: 'Asset could not be decoded', render: 'Rendered output needs review',
 };
-const formats: { format: ExportFormat; label: string; note: string }[] = [
-  { format: 'svg', label: 'SVG', note: 'Editable vector artwork' },
-  { format: 'png', label: 'PNG', note: 'Raster image' },
-  { format: 'glb', label: 'GLB', note: '3D meshes' },
-  { format: 'json', label: 'JSON', note: 'Scene source' },
+const formats: { key: string; format: ExportFormat; label: string; note: string; scale?: number; outlineText?: boolean }[] = [
+  { key: 'svg', format: 'svg', label: 'SVG', note: 'Editable vector artwork' },
+  { key: 'svg-outlined', format: 'svg', label: 'SVG · outlined text', note: 'Portable vector artwork', outlineText: true },
+  { key: 'pdf', format: 'pdf', label: 'PDF', note: 'Vector document · outlined text' },
+  { key: 'png', format: 'png', label: 'PNG · 1×', note: 'Artboard pixel size', scale: 1 },
+  { key: 'png-2', format: 'png', label: 'PNG · 2×', note: 'Double resolution', scale: 2 },
+  { key: 'png-4', format: 'png', label: 'PNG · 4×', note: 'Four times resolution', scale: 4 },
+  { key: 'glb', format: 'glb', label: 'GLB', note: '3D meshes' },
+  { key: 'json', format: 'json', label: 'JSON', note: 'Editable scene source' },
 ];
+
+function rememberedDocument() {
+  const fromUrl = new URL(location.href).searchParams.get('document');
+  if (fromUrl) return fromUrl;
+  try { return localStorage.getItem('grapher.documentId') ?? undefined; } catch { return undefined; }
+}
+
+function documentSummary(workspace: Workspace): DocumentSummary | undefined {
+  if (!workspace.documentId || !workspace.updatedAt) return undefined;
+  return { id: workspace.documentId, name: workspace.scene.name, width: workspace.scene.width, height: workspace.scene.height,
+    revision: workspace.revision, updatedAt: workspace.updatedAt };
+}
 
 function IconButton({ label, onClick, children, active, disabled }: {
   label: string;
@@ -64,7 +94,7 @@ function IconButton({ label, onClick, children, active, disabled }: {
 }
 
 function SampleLabel({ sampleKey, name, active }: { sampleKey: string; name: string; active: boolean }) {
-  const detail = sampleAppearance[sampleKey as keyof typeof sampleAppearance];
+  const detail = sampleAppearance[sampleKey as keyof typeof sampleAppearance] ?? { icon: Shapes, tone: 'orange' };
   const SampleIcon = detail.icon;
   return <>
     <span className={`example-icon ${detail.tone}`} aria-hidden="true"><SampleIcon size={16} /></span>
@@ -107,12 +137,19 @@ function AgentPart({ part }: { part: UIMessage['parts'][number] }) {
 }
 
 export function App() {
+  const [documentId, setDocumentId] = useState(rememberedDocument);
+  const client = useMemo(() => workspaceClient(location.origin, documentId), [documentId]);
+  const [documents, setDocuments] = useState<DocumentSummary[]>([]);
+  const [documentsReady, setDocumentsReady] = useState(false);
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [workspace, setWorkspace] = useState(starter);
   const [selected, setSelected] = useState<string>();
   const [sideTab, setSideTab] = useState<'layers' | 'examples'>('layers');
-  const [inspector, setInspector] = useState<'verify' | 'properties'>('verify');
+  const [inspector, setInspector] = useState<'verify' | 'properties' | 'history'>('verify');
   const [mode, setMode] = useState<'canvas' | 'mesh' | 'source'>('canvas');
-  const [menu, setMenu] = useState<'examples' | 'export'>();
+  const [menu, setMenu] = useState<'documents' | 'export'>();
+  const [contextOpen, setContextOpen] = useState(false);
   const [tool, setTool] = useState<'select' | 'pan'>('select');
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -124,64 +161,151 @@ export function App() {
   const [notice, setNotice] = useState<{ message: string; error?: boolean }>();
   const [past, setPast] = useState<Scene[]>([]);
   const [future, setFuture] = useState<Scene[]>([]);
+  const [propertyReset, setPropertyReset] = useState(0);
   const latest = useRef(starter);
+  const mutationBusy = useRef(false);
+  const activeDocument = useRef(documentId);
+  const importInput = useRef<HTMLInputElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const feed = useRef<HTMLDivElement>(null);
   const consoleInput = useRef<HTMLTextAreaElement>(null);
+  const finishingTextClick = useRef<Promise<boolean> | undefined>(undefined);
+  const composingText = useRef(false);
+  const artboard = useRef<HTMLDivElement>(null);
+  const keyboardMenuAnchor = useRef<HTMLSpanElement>(null);
   const drag = useRef<{ x: number; y: number } | undefined>(undefined);
   const { scene, revision, report } = workspace;
   const selectedLayer = scene.layers.find((layer) => layer.id === selected);
   const hasMesh = scene.layers.some((layer) => layer.kind === 'mesh' && layer.visible);
   const fixable = report.issues.some((issue) => issue.fixable);
   const issueCount = report.issues.length;
-  const art = useMemo(() => sceneSvg(scene), [scene]);
+  const needsReview = report.checks.some((check) => check.status === 'warn');
+  const allPassed = report.passed === report.total;
   const fit = Math.min(1, Math.max(0.15, (size.width - 90) / scene.width), Math.max(0.15, (size.height - 110) / scene.height));
   const scale = fit * zoom;
-  const bounds = selectedLayer?.visible ? layerBounds(selectedLayer) : undefined;
+
+  const rememberSummary = useCallback((next: Workspace) => {
+    const summary = documentSummary(next);
+    if (summary) setDocuments((items) => [summary, ...items.filter((item) => item.id !== summary.id)]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+  }, []);
+
+  const openDocument = useCallback((id: string, loaded?: Workspace) => {
+    activeDocument.current = id;
+    setDocumentId(id);
+    const next = loaded ?? { ...latest.current, documentId: id, revision: 0 };
+    latest.current = next;
+    setWorkspace(next);
+    setSelected(undefined);
+    setPast([]);
+    setFuture([]);
+    setHistoryEntries([]);
+    setMode('canvas');
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+    const url = new URL(location.href);
+    url.searchParams.set('document', id);
+    window.history.replaceState(null, '', url);
+    try { localStorage.setItem('grapher.documentId', id); } catch { /* URL still retains the selected document. */ }
+    if (loaded) rememberSummary(loaded);
+  }, [rememberSummary]);
 
   const accept = useCallback((next: Workspace, local = false) => {
+    if (next.documentId !== activeDocument.current) return false;
     const previous = latest.current;
     const restarted = next.workspaceId !== previous.workspaceId;
     if (!restarted && next.revision < previous.revision) return false;
     if (restarted || next.revision > previous.revision) {
       latest.current = next;
       setWorkspace(next);
+      rememberSummary(next);
       if (!local) {
         setPast([]);
         setFuture([]);
       }
     }
     return true;
-  }, []);
+  }, [rememberSummary]);
   const refresh = useCallback(async () => {
     try {
       const next = await client.inspect();
-      accept(next);
-      return next;
+      if (accept(next)) return next;
     } catch (error) {
-      setNotice({ message: String(error), error: true });
+      if (documentId === activeDocument.current) setNotice({ message: String(error), error: true });
     }
-  }, [accept]);
+  }, [accept, client, documentId]);
   const onWebMcpChange = useCallback((next: Workspace) => { accept(next); }, [accept]);
-  const webMcp = useGrapherTools(onWebMcpChange);
+  const webMcp = useGrapherTools(onWebMcpChange, documentId);
   const { messages, status, error, sendMessage, stop } = useChat({
+    id: documentId,
     transport,
     onFinish: () => { void refresh(); },
   });
   const running = status === 'submitted' || status === 'streaming';
+  const interaction = useCanvasInteractions({
+    workspace, selected, scale, enabled: !!revision && !working && mode === 'canvas' && tool === 'select' && !contextOpen,
+    keyboardEnabled: !!revision && mode === 'canvas' && tool === 'select' && !contextOpen,
+    select: setSelected,
+    commit: (operations, base) => mutate({ action: 'apply', operations }, true, base),
+    undo: () => { void travel('undo'); }, redo: () => { void travel('redo'); },
+    duplicate: () => { void duplicateSelection(); }, remove: () => { void deleteSelection(); },
+    notify: (message) => setNotice({ message, error: true }),
+  });
+  const preview = interaction.preview && interaction.preview.documentId === documentId ? interaction.preview.layer : undefined;
+  const displayScene = useMemo(() => preview ? { ...scene, layers: scene.layers.map((layer) => layer.id === preview.id ? preview : layer) } : scene, [scene, preview]);
+  const editedLayerId = interaction.editing?.layer.id;
+  const art = useMemo(() => sceneSvg(editedLayerId ? {
+    ...displayScene, layers: displayScene.layers.map((layer) => layer.id === editedLayerId ? { ...layer, visible: false } : layer),
+  } : displayScene, { outlineText: true }), [displayScene, editedLayerId]);
+  const shownSelection = preview?.id === selected ? preview : selectedLayer;
+  const bounds = shownSelection?.visible ? layerBounds(shownSelection) : undefined;
 
   useEffect(() => {
     if (!hasMesh && mode === 'mesh') setMode('canvas');
   }, [hasMesh, mode]);
 
   useEffect(() => {
+    let cancelled = false;
+    let retry: number | undefined;
+    const connect = () => void workspaceClient(location.origin).documents().then(({ documents: saved, defaultDocumentId }) => {
+      if (cancelled) return;
+      setDocuments(saved);
+      const requested = activeDocument.current;
+      openDocument(saved.some((item) => item.id === requested) ? requested! : defaultDocumentId);
+      setDocumentsReady(true);
+    }).catch((error) => {
+      if (!cancelled) {
+        setNotice({ message: String(error), error: true });
+        retry = window.setTimeout(connect, 3000);
+      }
+    });
+    connect();
+    void fetch('/api/config').then((response) => response.json()).then((config) => {
+      if (!cancelled) setModelEnabled(config.modelEnabled);
+    }).catch(() => {});
+    return () => { cancelled = true; window.clearTimeout(retry); };
+  }, [openDocument]);
+
+  useEffect(() => {
+    if (!documentsReady || !documentId) return;
     void refresh();
-    void fetch('/api/config').then((response) => response.json()).then((config) => setModelEnabled(config.modelEnabled)).catch(() => {});
     const interval = window.setInterval(() => {
       void client.inspect().then(accept).catch(() => {});
     }, 2400);
     return () => window.clearInterval(interval);
-  }, [accept, refresh]);
+  }, [accept, client, documentId, documentsReady, refresh]);
+
+  useEffect(() => {
+    if (inspector !== 'history' || !revision) return;
+    const controller = new AbortController();
+    setHistoryLoading(true);
+    void client.history(controller.signal).then(({ entries }) => {
+      if (documentId === activeDocument.current) setHistoryEntries(entries);
+    }).catch((error) => {
+      if (!controller.signal.aborted && documentId === activeDocument.current) setNotice({ message: String(error), error: true });
+    }).finally(() => { if (!controller.signal.aborted) setHistoryLoading(false); });
+    return () => controller.abort();
+  }, [client, documentId, inspector, revision]);
 
   useEffect(() => {
     const element = stage.current;
@@ -206,31 +330,26 @@ export function App() {
     if (feed.current) feed.current.scrollTop = feed.current.scrollHeight;
   }, [messages, consoleOpen, status]);
 
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        setSelected(undefined);
-      }
-    }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
-
-  async function mutate(input: Parameters<typeof client.edit>[0], remember = true) {
-    if (working || !revision) return;
+  async function mutate(input: Parameters<typeof client.edit>[0], remember = true, base = workspace) {
+    if (mutationBusy.current || !base.revision || base.documentId !== activeDocument.current) return;
+    mutationBusy.current = true;
     setWorking(true);
     try {
-      const next = await client.edit({ ...input, revision });
+      const next = await workspaceClient(location.origin, base.documentId).edit({ ...input, documentId: base.documentId, revision: base.revision });
       if (!accept(next, true)) return;
-      if (next.revision !== revision && remember) {
-        setPast((history) => [...history.slice(-19), scene]);
+      if (next.revision !== base.revision && remember) {
+        setPast((history) => [...history.slice(-19), base.scene]);
         setFuture([]);
       }
       return next;
     } catch (error) {
-      setNotice({ message: error instanceof Error ? error.message : 'The canvas update failed.', error: true });
-      void refresh();
+      if (documentId === activeDocument.current) {
+        setNotice({ message: error instanceof Error ? error.message : 'The canvas update failed.', error: true });
+        setPropertyReset((value) => value + 1);
+        void refresh();
+      }
     } finally {
+      mutationBusy.current = false;
       setWorking(false);
     }
   }
@@ -254,13 +373,78 @@ export function App() {
     setOffset({ x: 0, y: 0 });
   }
 
-  async function loadExample(key: string) {
-    if (!await mutate({ action: 'replace', scene: examples[key] })) return;
-    setSelected(undefined);
-    setMode('canvas');
-    setSideTab('layers');
-    setInspector('verify');
-    fitCanvas();
+  async function createDocument(input: Parameters<typeof client.create>[0]) {
+    if (working || mutationBusy.current || !documentsReady) return;
+    mutationBusy.current = true;
+    setWorking(true);
+    try {
+      const next = await client.create(input);
+      if (!next.documentId) throw new Error('The new document did not return an ID.');
+      openDocument(next.documentId, next);
+      setSideTab('layers');
+      setInspector('verify');
+      setNotice({ message: `Created ${next.scene.name}` });
+    } catch (error) {
+      setNotice({ message: error instanceof Error ? error.message : 'Could not create the document.', error: true });
+    } finally {
+      mutationBusy.current = false;
+      setWorking(false);
+    }
+  }
+
+  function documentAction(action: string) {
+    if (action === 'new') return createDocument({ name: 'Untitled document' });
+    if (action === 'duplicate') return createDocument({ scene, name: `${scene.name.slice(0, 295)} copy` });
+    if (action === 'import') return importInput.current?.click();
+    if (action.startsWith('sample:')) return createDocument({ template: action.slice('sample:'.length) });
+    if (action.startsWith('document:')) openDocument(action.slice('document:'.length));
+  }
+
+  function toggleDocumentMenu(open: boolean) {
+    setMenu(open ? 'documents' : undefined);
+    if (open) void client.documents().then(({ documents: saved }) => setDocuments((current) => {
+      const merged = new Map(current.map((item) => [item.id, item]));
+      for (const item of saved) {
+        if (item.revision >= (merged.get(item.id)?.revision ?? 0)) merged.set(item.id, item);
+      }
+      return [...merged.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }))
+      .catch((error) => setNotice({ message: String(error), error: true }));
+  }
+
+  async function importDocument(file: File) {
+    try {
+      if (file.size > 8 * 1024 * 1024) throw new Error('Choose a scene JSON file smaller than 8 MB.');
+      const source = JSON.parse(await file.text());
+      await createDocument({ scene: source.scene ?? source });
+    } catch (error) {
+      setNotice({ message: error instanceof Error ? error.message : 'The file could not be imported.', error: true });
+    }
+  }
+
+  async function restoreRevision(targetRevision: number) {
+    if (working || mutationBusy.current || !revision) return;
+    mutationBusy.current = true;
+    setWorking(true);
+    try {
+      const next = await client.restore(targetRevision, revision);
+      if (!accept(next, true)) return;
+      if (next.revision !== revision) {
+        setPast((history) => [...history.slice(-19), scene]);
+        setFuture([]);
+      }
+      setSelected(undefined);
+      setNotice({ message: next.revision === revision ? 'This revision already matches the current document.'
+        : `Restored revision ${targetRevision} as revision ${next.revision}` });
+    } catch (error) {
+      if (documentId === activeDocument.current) {
+        setNotice({ message: String(error), error: true });
+        void refresh();
+      }
+    } finally {
+      mutationBusy.current = false;
+      setWorking(false);
+    }
   }
 
   async function repair() {
@@ -270,9 +454,10 @@ export function App() {
     setNotice({ message: changes ? `Applied ${changes} ${changes === 1 ? 'fix' : 'fixes'} · ${next.report.passed}/${next.report.total} checks passed` : 'No automatic fixes available.' });
   }
 
-  async function exportScene(format: ExportFormat) {
+  async function exportScene(format: ExportFormat, options: { scale?: number; outlineText?: boolean } = {}) {
+    if (!revision) return;
     try {
-      const response = await client.export(format);
+      const response = await client.export(format, revision, undefined, options);
       const name = response.headers.get('content-disposition')?.match(/filename="([^"]+)"/)?.[1] ?? `grapher.${format}`;
       download(await response.blob(), name);
       setNotice({ message: `${format.toUpperCase()} exported · revision ${response.headers.get('x-grapher-revision') ?? revision}` });
@@ -300,10 +485,60 @@ export function App() {
     return mutate({ action: 'apply', operations: [{ op: 'update', id: layer.id, patch }] });
   }
 
-  function pick(event: MouseEvent<HTMLDivElement>) {
-    if (tool === 'pan') return;
-    const element = (event.target as Element).closest('[data-layer-id]');
-    setSelected(element?.getAttribute('data-layer-id') ?? undefined);
+  function layerAt(target: EventTarget | null) {
+    const id = target instanceof Element ? target.closest('[data-layer-id]')?.getAttribute('data-layer-id') : undefined;
+    return scene.layers.find((layer) => layer.id === id);
+  }
+
+  function canvasPointerDown(event: PointerEvent<HTMLDivElement>) {
+    if (tool !== 'select' || event.button !== 0 || (event.target as Element).closest('[data-canvas-editor], [data-resize-handle]')) return;
+    const layer = layerAt(event.target);
+    if (layer) { setInspector('properties'); interaction.begin(event, layer); }
+    else if (!interaction.editing) { setSelected(undefined); artboard.current?.focus({ preventScroll: true }); }
+  }
+
+  function canvasDoubleClick(event: MouseEvent<HTMLDivElement>) {
+    if (tool !== 'select' || isTextInput(event.target)) return;
+    const layer = layerAt(event.target) ?? layerAt(document.elementFromPoint(event.clientX, event.clientY));
+    if (layer?.kind === 'text') { event.preventDefault(); interaction.beginText(layer, { x: event.clientX, y: event.clientY }); }
+  }
+
+  async function finishText(target?: Element) {
+    if (composingText.current) return false;
+    if (!await interaction.saveText()) {
+      artboard.current?.querySelector<HTMLTextAreaElement>('.canvas-text-editor textarea')?.focus({ preventScroll: true });
+      return false;
+    }
+    if (target?.closest('.stage')) setSelected(layerAt(target)?.id);
+    artboard.current?.focus({ preventScroll: true });
+    return true;
+  }
+
+  async function deleteSelection() {
+    if (!selectedLayer) return;
+    if (await mutate({ action: 'apply', operations: [{ op: 'remove', id: selectedLayer.id }] })) setSelected(undefined);
+  }
+
+  async function duplicateSelection() {
+    if (!selectedLayer) return;
+    const operations = duplicateLayers(scene, [selectedLayer.id]);
+    if (await mutate({ action: 'apply', operations })) {
+      const copy = operations.find((operation) => operation.op === 'add');
+      if (copy?.op === 'add') setSelected(copy.layer.id);
+    }
+  }
+
+  async function layerAction(action: string) {
+    if (!selectedLayer) return;
+    if (action === 'text') {
+      setContextOpen(false);
+      window.requestAnimationFrame(() => interaction.beginText(selectedLayer));
+    } else if (action === 'duplicate') await duplicateSelection();
+    else if (action === 'delete') await deleteSelection();
+    else if (action === 'front' || action === 'back') {
+      const operation: Operation = { op: 'reorder', id: selectedLayer.id, index: action === 'front' ? scene.layers.length - 1 : 0 };
+      await mutate({ action: 'apply', operations: [operation] });
+    }
   }
 
   function panStart(event: PointerEvent<HTMLDivElement>) {
@@ -325,36 +560,67 @@ export function App() {
 
   function runPrompt(value: string) {
     const text = value.trim();
-    if (!text || running) return;
+    if (!text || running || !revision || !documentId) return;
     setBrief('');
-    void sendMessage({ text }, { body: { revision: revision || undefined } }).catch(() => {});
+    void sendMessage({ text }, { body: { documentId, revision, selectedLayerIds: selectedLayer ? [selectedLayer.id] : [] } }).catch(() => {});
   }
 
-  const library = Object.entries(examples).map(([key, item]) =>
-    <Button className="example-item" key={key} type="button" disabled={working || !revision} onClick={() => loadExample(key)}>
-      <SampleLabel sampleKey={key} name={item.name} active={scene.name === item.name} />
+  const library = samples.map(({ key, name }) =>
+    <Button className="example-item" key={key} type="button" disabled={working || !documentsReady} onClick={() => createDocument({ template: key })}>
+      <SampleLabel sampleKey={key} name={name} active={false} />
     </Button>);
 
-  return <div className="studio">
+  return <div className="studio" onPointerDownCapture={(event) => {
+    finishingTextClick.current = undefined;
+    if (!interaction.editing || (event.target as Element).closest('[data-canvas-editor]')) return;
+    event.preventDefault(); event.stopPropagation();
+    const finished = finishText(event.target as Element);
+    if (event.button === 0) finishingTextClick.current = finished;
+  }} onClickCapture={(event) => {
+    if (finishingTextClick.current) {
+      const finished = finishingTextClick.current;
+      finishingTextClick.current = undefined;
+      event.preventDefault(); event.stopPropagation();
+      const control = (event.target as Element).closest<HTMLElement>('button, a, input, select, textarea');
+      if (control && !control.closest('.artboard')) void finished.then((saved) => {
+        if (!saved || !control.isConnected) return;
+        control.focus({ preventScroll: true });
+        if (control.matches('button, a')) control.click();
+      });
+    }
+  }}>
     <header className="app-header">
       <div className="header-left">
         <div className="brand"><BrandMark /><span>Grapher</span></div>
         <span className="header-divider" />
         <div className="menu-anchor">
-          <Menu open={menu === 'examples'} onOpenChange={(open) => setMenu(open ? 'examples' : undefined)} onAction={loadExample}>
+          <Menu open={menu === 'documents'} onOpenChange={toggleDocumentMenu} onAction={documentAction}>
             <MenuTrigger className="document-button">
               <span>{scene.name}</span><ChevronDown size={13} />
             </MenuTrigger>
-            <MenuContent className="pop-menu project-menu" aria-label="Load a sample scene" sideOffset={10} align="start">
-              <MenuGroup>
-                <MenuGroupLabel className="menu-caption">Load a sample scene</MenuGroupLabel>
-                {Object.entries(examples).map(([key, item]) =>
-                  <MenuItem className="example-item" key={key} value={key} label={item.name} disabled={working || !revision}>
-                    <SampleLabel sampleKey={key} name={item.name} active={scene.name === item.name} />
+            <MenuContent className="pop-menu project-menu" aria-label="Documents" sideOffset={10} align="start">
+              <MenuGroup className="saved-documents">
+                <MenuGroupLabel className="menu-caption">Saved documents</MenuGroupLabel>
+                {documents.map((item) =>
+                  <MenuItem className="saved-document" key={item.id} value={`document:${item.id}`} label={item.name} disabled={working || item.id === documentId}>
+                    <span><strong>{item.name}</strong><small>{item.width} × {item.height} · Revision {item.revision}</small></span>
+                    {item.id === documentId && <Check size={14} aria-label="Current document" />}
                   </MenuItem>)}
+              </MenuGroup>
+              <MenuGroup className="document-actions">
+                <MenuItem value="new" label="New blank document" disabled={working || !documentsReady}><FilePlus2 size={15} /> New blank document</MenuItem>
+                <MenuItem value="import" label="Import scene JSON" disabled={working || !documentsReady}><FileUp size={15} /> Import scene JSON</MenuItem>
+                <MenuItem value="duplicate" label="Duplicate document" disabled={working || !revision}><Copy size={15} /> Duplicate document</MenuItem>
+              </MenuGroup>
+              <MenuGroup className="document-samples">
+                <MenuGroupLabel className="menu-caption">New from sample</MenuGroupLabel>
+                {samples.map(({ key, name }) => <MenuItem className="example-item" key={key} value={`sample:${key}`} label={name}
+                  disabled={working || !documentsReady}><SampleLabel sampleKey={key} name={name} active={false} /></MenuItem>)}
               </MenuGroup>
             </MenuContent>
           </Menu>
+          <input ref={importInput} className="file-input" type="file" accept=".json,application/json" aria-label="Import scene JSON file"
+            onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void importDocument(file); }} />
         </div>
       </div>
       <div className="header-actions">
@@ -363,10 +629,10 @@ export function App() {
         </button>
         <div className="menu-anchor">
           <Menu open={menu === 'export'} onOpenChange={(open) => setMenu(open ? 'export' : undefined)}
-            onAction={(format) => exportScene(format as ExportFormat)}>
+            onAction={(key) => { const option = formats.find((item) => item.key === key); if (option) void exportScene(option.format, option); }}>
             <MenuTrigger className="export-button"><ArrowDownToLine size={15} /> Export <ChevronDown size={12} /></MenuTrigger>
             <MenuContent className="pop-menu export-menu" aria-label="Export scene" sideOffset={10} align="end">
-              {formats.map(({ format, label, note }) => <MenuItem key={format} value={format} label={label} disabled={format === 'glb' && !hasMesh}>
+              {formats.map(({ key, format, label, note }) => <MenuItem key={key} value={key} label={label} disabled={!revision || (format === 'glb' && !hasMesh)}>
                 <strong>{label}</strong><small>{note}</small>
               </MenuItem>)}
             </MenuContent>
@@ -393,6 +659,7 @@ export function App() {
                   <LayerIcon size={14} /><span>{layer.name}</span>
                 </button>
                 <button className="visibility-button" aria-label={`${layer.visible ? 'Hide' : 'Show'} ${layer.name}`}
+                  disabled={working || !revision}
                   onClick={() => void patchLayer(layer, { visible: !layer.visible })}>
                   {layer.visible ? <Eye size={13} /> : <EyeOff size={13} />}
                 </button>
@@ -401,7 +668,7 @@ export function App() {
           </div>
           <div className="layers-bottom"><span className="layer-dot" /> {scene.layers.filter((layer) => layer.visible).length} visible layers</div>
         </TabsPanel>
-        <TabsPanel value="examples" className="example-library">{library}</TabsPanel>
+        <TabsPanel value="examples" className="example-library"><p className="sample-note">Start a new document from a sample.</p>{library}</TabsPanel>
       </Tabs>
 
       <section className="canvas-panel" aria-label="Canvas preview">
@@ -410,10 +677,10 @@ export function App() {
             <IconButton label="Select tool" onClick={() => setTool('select')} active={tool === 'select'}><MousePointer2 size={16} /></IconButton>
             <IconButton label="Pan tool" onClick={() => setTool('pan')} active={tool === 'pan'}><Hand size={16} /></IconButton>
             <span className="tool-divider" />
-            <IconButton label="Add rectangle" onClick={() => void addLayer('rect')} disabled={working}><Square size={15} /></IconButton>
-            <IconButton label="Add ellipse" onClick={() => void addLayer('ellipse')} disabled={working}><Circle size={15} /></IconButton>
-            <IconButton label="Add text" onClick={() => void addLayer('text')} disabled={working}><Type size={16} /></IconButton>
-            <IconButton label="Add 3D primitive" onClick={() => void addLayer('mesh')} disabled={working}><Box size={16} /></IconButton>
+            <IconButton label="Add rectangle" onClick={() => void addLayer('rect')} disabled={working || !revision}><Square size={15} /></IconButton>
+            <IconButton label="Add ellipse" onClick={() => void addLayer('ellipse')} disabled={working || !revision}><Circle size={15} /></IconButton>
+            <IconButton label="Add text" onClick={() => void addLayer('text')} disabled={working || !revision}><Type size={16} /></IconButton>
+            <IconButton label="Add 3D primitive" onClick={() => void addLayer('mesh')} disabled={working || !revision}><Box size={16} /></IconButton>
             <span className="tool-divider history-tool" />
             <span className="history-tool"><IconButton label="Undo" onClick={() => void travel('undo')} disabled={working || !past.length}><Undo2 size={15} /></IconButton></span>
             <span className="history-tool"><IconButton label="Redo" onClick={() => void travel('redo')} disabled={working || !future.length}><Redo2 size={15} /></IconButton></span>
@@ -430,21 +697,65 @@ export function App() {
           onPointerCancel={() => { drag.current = undefined; }}>
           {mode === 'canvas' && <div className="board-wrap" style={{ width: scene.width * scale, transform: `translate(${offset.x}px, ${offset.y}px)` }}>
             <div className="board-meta"><span><Crosshair size={13} /> {scene.name}</span><span>{scene.width} × {scene.height}</span></div>
-            <div className="artboard" style={{ height: scene.height * scale }} onClick={pick}>
-              <div className="artwork" dangerouslySetInnerHTML={{ __html: art }} />
-              {bounds && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }} />}
-            </div>
+            <Menu open={contextOpen} onOpenChange={setContextOpen} onAction={layerAction}>
+              <MenuContextTrigger ref={artboard} className={`artboard ${tool === 'select' ? 'selectable-artboard' : ''}`}
+                style={{ height: scene.height * scale }} tabIndex={0} aria-label="Editable artboard" aria-describedby="canvas-keyboard-help"
+                onPointerDown={canvasPointerDown} onPointerMove={interaction.move} onPointerUp={() => void interaction.finish()}
+                onPointerCancel={() => interaction.cancel()} onLostPointerCapture={interaction.release} onDoubleClick={canvasDoubleClick}
+                onKeyDown={(event) => {
+                  if (!isTextInput(event.target) && ((event.shiftKey && event.key === 'F10') || event.key === 'ContextMenu')) {
+                    event.preventDefault(); event.stopPropagation();
+                    const board = event.currentTarget.getBoundingClientRect();
+                    const anchor = keyboardMenuAnchor.current;
+                    if (!anchor) return;
+                    // The SDK anchors keyboard context menus to the event target, overriding MenuContent.anchor.
+                    anchor.style.left = `${Math.max(12, Math.min(window.innerWidth - 12, board.left + (bounds?.x ?? 0) * scale)) - board.left}px`;
+                    anchor.style.top = `${Math.max(12, Math.min(window.innerHeight - 12, board.top + ((bounds?.y ?? 0) + (bounds?.height ?? 0)) * scale)) - board.top}px`;
+                    anchor.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 0 }));
+                  }
+                }}
+                onContextMenuCapture={(event) => {
+                  if (isTextInput(event.target)) { event.stopPropagation(); return; }
+                  const layer = layerAt(event.target);
+                  if (layer) { setSelected(layer.id); setInspector('properties'); }
+                  else if ((event.clientX || event.clientY) && !(event.target as Element).closest('[data-resize-handle]')) setSelected(undefined);
+                }}>
+                <div className="artwork" dangerouslySetInnerHTML={{ __html: art }} />
+                <span ref={keyboardMenuAnchor} className="keyboard-menu-anchor" aria-hidden="true" />
+                {bounds && !interaction.editing && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }}>
+                  {!interaction.editing && !selectedLayer?.rotationDeg && tool === 'select' && (['nw', 'ne', 'se', 'sw'] as const).map((corner) =>
+                    <button key={corner} type="button" className={`resize-handle handle-${corner}`} data-resize-handle={corner}
+                      aria-label={`Resize ${corner === 'nw' ? 'top left' : corner === 'ne' ? 'top right' : corner === 'se' ? 'bottom right' : 'bottom left'}`}
+                      disabled={working || !revision} onPointerDown={(event) => {
+                        event.stopPropagation(); if (selectedLayer) interaction.begin(event, selectedLayer, corner);
+                      }} />)}
+                </div>}
+                {interaction.editing && <CanvasTextEditor key={interaction.editing.layer.id} edit={interaction.editing} scale={scale}
+                  saving={interaction.textSaving} onChange={interaction.changeText} onFinish={() => void finishText()}
+                  onCompositionChange={(active) => { composingText.current = active; }}
+                  onCancel={() => { interaction.cancel(); artboard.current?.focus(); }} />}
+              </MenuContextTrigger>
+              <CanvasContextMenu selectedLayer={selectedLayer} working={working} finalFocus={() => artboard.current} />
+            </Menu>
           </div>}
           {mode === 'mesh' && <Suspense fallback={<div className="view-loading">Opening 3D view…</div>}><MeshPreview scene={scene} /></Suspense>}
           {mode === 'source' && <div className="source-view">
             <div><strong>Scene source</strong><button onClick={() => void exportScene('json')}><ArrowDownToLine size={14} /> Download JSON</button></div>
             <pre>{JSON.stringify(scene, null, 2)}</pre>
           </div>}
-          {mode === 'canvas' && <div className="zoom-widget">
+          {interaction.editing && <div className="text-edit-controls" data-canvas-editor="true" role="group" aria-label="Text editing">
+            <span id="text-edit-help">{interaction.editing.conflict ? 'Document changed. Your draft is kept—copy it before cancelling.'
+              : interaction.textSaving ? 'Saving…' : 'Click outside to finish · Ctrl/⌘ + Enter · Esc to cancel'}</span>
+            <Button disabled={interaction.textSaving} onClick={() => { interaction.cancel(); artboard.current?.focus(); }}>Cancel</Button>
+            <Button className="text-edit-done" disabled={interaction.textSaving || interaction.editing.conflict} onClick={() => void finishText()}>Done</Button>
+          </div>}
+          {mode === 'canvas' && !interaction.editing && <div className="zoom-widget">
             <IconButton label="Zoom out" onClick={() => setZoom((value) => Math.max(0.25, value / 1.2))}><Minus size={15} /></IconButton>
             <button className="zoom-value" onClick={fitCanvas} title="Reset zoom">{Math.round(scale * 100)}%</button>
             <IconButton label="Zoom in" onClick={() => setZoom((value) => Math.min(4, value * 1.2))}><Plus size={15} /></IconButton>
           </div>}
+          {!revision && <div className="document-loading" role="status">Opening document…</div>}
+          <p id="canvas-keyboard-help" className="sr-only">Drag an element to move it. Double-click text to edit it. Arrow keys move by one pixel; Shift and arrow keys move by ten. Escape cancels. Right-click or Shift F10 opens selection actions.</p>
           {notice && <div className={`toast ${notice.error ? 'toast-error' : ''}`} role={notice.error ? 'alert' : 'status'}>
             {notice.error ? <CircleAlert size={16} /> : <CircleCheck size={16} />}<span>{notice.message}</span>
           </div>}
@@ -462,15 +773,17 @@ export function App() {
             {error && <p className="console-error" role="alert">{error.message}</p>}
           </div>
           <div className="prompt-buttons">
-            {['Verify the canvas', 'Fix the current issues', 'Load Cryo Cache sample'].map((prompt) =>
-              <button key={prompt} onClick={() => runPrompt(prompt)} disabled={running}>{prompt}</button>)}
+            {['Verify the canvas', 'Fix the current issues', 'Render this document'].map((prompt) =>
+              <button key={prompt} onClick={() => runPrompt(prompt)} disabled={running || !revision}>{prompt}</button>)}
           </div>
+          {selectedLayer && <div className="selection-context"><Crosshair size={12} /><span>Selected: {selectedLayer.name}</span>
+            <button type="button" aria-label="Remove selection context" onClick={() => setSelected(undefined)}><X size={12} /></button></div>}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); runPrompt(brief); }}>
             <textarea ref={consoleInput} value={brief} maxLength={4000} aria-label="Agent brief" placeholder="Describe a change or enter a command…"
               onChange={(event) => setBrief(event.target.value)}
               onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runPrompt(brief); } }} />
             {running ? <button type="button" title="Stop agent" aria-label="Stop agent" onClick={() => { void stop(); void refresh(); }}><Square size={14} /></button>
-              : <button type="submit" aria-label="Send to agent" disabled={!brief.trim()}><ArrowUp size={17} /></button>}
+              : <button type="submit" aria-label="Send to agent" disabled={!brief.trim() || !revision}><ArrowUp size={17} /></button>}
           </form>
         </section>}
       </section>
@@ -482,6 +795,7 @@ export function App() {
           <TabsTab className="tab" value="verify"><ScanLine size={15} /> Verify
             {issueCount > 0 && <span className="tab-count">{issueCount}</span>}
           </TabsTab>
+          <TabsTab className="tab" value="history">History</TabsTab>
         </TabsList>
         <TabsPanel value="verify" className="verify-scroll">
           <div className="verify-heading"><h1>Verification</h1>
@@ -490,20 +804,22 @@ export function App() {
               if (next) setNotice({ message: `${next.report.passed}/${next.report.total} checks passed · revision ${next.revision}` });
             }}><RotateCw size={15} /></IconButton>
           </div>
-          <div className={`report-card ${issueCount ? '' : 'all-pass'}`}>
-            <span className="report-symbol">{issueCount ? <CircleAlert size={19} /> : <CircleCheck size={19} />}</span>
-            <div><strong>{issueCount ? `${issueCount} ${issueCount === 1 ? 'issue' : 'issues'} found` : 'All checks passed'}</strong>
+          <div className={`report-card ${allPassed ? 'all-pass' : ''}`}>
+            <span className="report-symbol">{allPassed ? <CircleCheck size={19} /> : <CircleAlert size={19} />}</span>
+            <div><strong>{allPassed ? 'All checks passed' : needsReview && !report.checks.some((check) => check.status === 'fail') ? 'Needs review'
+              : `${issueCount} ${issueCount === 1 ? 'issue' : 'issues'} found`}</strong>
               <p>{report.passed} of {report.total} checks passed</p></div>
-            <div className="report-meter" aria-label={`${report.passed} of ${report.total} checks passed`}>
+            <div className="report-meter" style={{ gridTemplateColumns: `repeat(${report.total}, 1fr)` }} aria-label={`${report.passed} of ${report.total} checks passed`}>
               {report.checks.map((check) => <span key={check.id} className={check.status} />)}
             </div>
           </div>
           {issueCount > 0 && <section className="issue-section">
-            <h2>Issues <span>{issueCount}</span></h2>
+            <h2>Findings <span>{issueCount}</span></h2>
             <div className="issue-list">
               {report.issues.map((issue) => <button key={issue.id} className="issue-card" onClick={() => selectIssue(issue.layerId)}>
                 <span className="issue-icon"><CircleAlert size={15} /></span>
-                <span className="issue-content"><strong>{issueTitles[issue.checkId] || 'Canvas issue'}</strong><small>{issue.message}</small></span>
+                <span className="issue-content"><strong>{issue.checkId === 'contrast' && issue.severity === 'warning'
+                  ? 'Contrast needs review' : issueTitles[issue.checkId] || 'Canvas issue'}</strong><small>{issue.message}</small></span>
                 <Crosshair className="issue-focus" size={14} aria-label="Locate layer" />
               </button>)}
             </div>
@@ -516,15 +832,29 @@ export function App() {
             <div className="checks-list">
               {report.checks.map((check) => <div className="check-row" key={check.id} title={check.detail}>
                 {check.status === 'pass' ? <CircleCheck size={15} className="check-pass" /> : <CircleAlert size={15} className="check-fail" />}
-                <span>{check.label}</span><small className={check.status}>{check.status === 'pass' ? 'Pass' : 'Flagged'}</small>
+                <span>{check.label}</span><small className={check.status}>{check.status === 'pass' ? 'Pass' : check.status === 'warn' ? 'Needs review' : 'Flagged'}</small>
               </div>)}
             </div>
           </section>
           <div className="verify-note"><ScanLine size={13} /> Revision {revision || '…'}</div>
         </TabsPanel>
+        <TabsPanel value="history" className="history-scroll">
+          <div className="verify-heading"><h1>Version history</h1><History size={17} /></div>
+          <p className="history-note">Every saved change is kept. Restoring a version creates a new revision.</p>
+          {historyLoading && !historyEntries.length && <p className="history-note" role="status">Loading revisions…</p>}
+          <ol className="revision-list">
+            {historyEntries.map((entry) => <li key={entry.revision} className={entry.revision === revision ? 'current-revision' : ''}>
+              <div className="revision-heading"><strong>Revision {entry.revision}</strong>{entry.revision === revision && <span>Current</span>}</div>
+              <p>{entry.summary}</p>
+              <time dateTime={entry.createdAt}>{new Date(entry.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</time>
+              {entry.revision !== revision && <Button type="button" className="restore-button" disabled={working || !revision}
+                onClick={() => void restoreRevision(entry.revision)}><RotateCw size={13} /> Restore this version</Button>}
+            </li>)}
+          </ol>
+        </TabsPanel>
         <TabsPanel value="properties" className="property-scroll">
           <h1>{selectedLayer ? 'Layer properties' : 'Artboard properties'}</h1>
-          {selectedLayer ? <div className="properties" key={JSON.stringify(selectedLayer)}>
+          {selectedLayer ? <fieldset className="properties" disabled={working || !revision} key={`${JSON.stringify(selectedLayer)}:${propertyReset}`}>
             <div className="property-kind">{selectedLayer.kind} layer</div>
             <label>Name<input defaultValue={selectedLayer.name} onBlur={(event) => {
               if (event.target.value !== selectedLayer.name) void patchLayer(selectedLayer, { name: event.target.value });
@@ -538,6 +868,16 @@ export function App() {
                 if (Number.isFinite(value) && value !== selectedLayer[axis]) void patchLayer(selectedLayer, { [axis]: value });
               }} /></label>)}
             </div>}
+            {'width' in selectedLayer && 'height' in selectedLayer && <div className="property-grid">
+              {(['width', 'height'] as const).map((dimension) => <label key={dimension}>{dimension === 'width' ? 'Width' : 'Height'}<input type="number" min="1" step="1" defaultValue={selectedLayer[dimension]} onBlur={(event) => {
+                const value = event.target.valueAsNumber;
+                if (Number.isFinite(value) && value > 0 && value !== selectedLayer[dimension]) void patchLayer(selectedLayer, { [dimension]: value });
+              }} /></label>)}
+            </div>}
+            {selectedLayer.kind === 'text' && <label>Font size<input type="number" min="1" step="1" defaultValue={selectedLayer.fontSize} onBlur={(event) => {
+              const value = event.target.valueAsNumber;
+              if (Number.isFinite(value) && value > 0 && value !== selectedLayer.fontSize) void patchLayer(selectedLayer, { fontSize: value });
+            }} /></label>}
             {'fill' in selectedLayer && <label>Fill<input defaultValue={selectedLayer.fill} onBlur={(event) => {
               if (event.target.value !== selectedLayer.fill) void patchLayer(selectedLayer, { fill: event.target.value });
             }} /></label>}
@@ -547,18 +887,21 @@ export function App() {
             <button className="remove-layer" onClick={async () => {
               if (await mutate({ action: 'apply', operations: [{ op: 'remove', id: selectedLayer.id }] })) setSelected(undefined);
             }}>Delete layer</button>
-          </div> : <div className="properties">
+          </fieldset> : <fieldset className="properties" disabled={working || !revision} key={`${documentId}:${propertyReset}`}>
             <div className="property-kind">Select a layer to inspect its properties.</div>
+            <label>Document name<input key={scene.name} defaultValue={scene.name} onBlur={(event) => {
+              if (event.target.value.trim() && event.target.value !== scene.name) void mutate({ action: 'replace', scene: { ...scene, name: event.target.value } });
+            }} /></label>
             <div className="property-grid"><label>Width<input readOnly value={scene.width} /></label><label>Height<input readOnly value={scene.height} /></label></div>
             <label>Background<input key={scene.background} defaultValue={scene.background} onBlur={(event) => {
               if (event.target.value !== scene.background) void mutate({ action: 'replace', scene: { ...scene, background: event.target.value } });
             }} /></label>
-          </div>}
+          </fieldset>}
         </TabsPanel>
       </Tabs>
     </main>
     <footer className="status-bar">
-      <div><span className="status-led" /> {revision ? 'Workspace online' : 'Connecting…'} <span className="status-separator" /> <span className="status-revision">rev {revision || '—'}</span></div>
+      <div><span className="status-led" /> {working ? 'Saving…' : revision ? 'Saved locally' : 'Connecting…'} <span className="status-separator" /> <span className="status-revision">rev {revision || '—'}</span></div>
       <div><span className="protocol-status"><span className="protocol-dot" /> {webMcp ? 'WebMCP registered' : 'MCP / CLI ready'}</span>
         <button className="footer-console" onClick={() => setConsoleOpen(!consoleOpen)} aria-label="Toggle agent console"><SquareTerminal size={14} /></button></div>
     </footer>

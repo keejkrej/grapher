@@ -1,17 +1,27 @@
 import { z } from 'zod'
+import { SVGPathData } from 'svg-pathdata'
+import { diagramSchema } from './diagram-schema.ts'
+import { plotSchema } from './plot-schema.ts'
+import { measureText, missingGlyphs, needsComplexShaping, normalizeFontFamily, textInkBounds, textMetrics, textOutline, wrapText } from './typography.ts'
 
 const number = z.number().finite()
 const text = z.string().max(300)
-const paint = z.string().max(32)
+const paint = z.string().max(160)
 const boxSchema = z.strictObject({ x: number, y: number, width: number, height: number })
 const layerFields = {
   id: z.string().min(1).max(100),
   name: text,
   visible: z.boolean().default(true),
+  opacity: number.min(0).max(1).optional(),
+  rotationDeg: number.optional().describe('Rotation about the layer center, in degrees.'),
 }
-const strokeFields = { stroke: paint.optional(), strokeWidth: number.optional() }
+const strokeFields = {
+  stroke: paint.optional(), strokeWidth: number.optional(),
+  strokeDasharray: z.array(number.min(0)).min(1).max(20).optional(),
+  strokeLinecap: z.enum(['butt', 'round', 'square']).optional(),
+}
 const layerSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ ...layerFields, ...boxSchema.shape, kind: z.literal('rect'), fill: paint, rx: number.optional() }),
+  z.strictObject({ ...layerFields, ...boxSchema.shape, ...strokeFields, kind: z.literal('rect'), fill: paint, rx: number.optional() }),
   z.strictObject({
     ...layerFields,
     ...strokeFields,
@@ -33,6 +43,9 @@ const layerSchema = z.discriminatedUnion('kind', [
     fontFamily: z.string().max(160).optional(),
     fontWeight: z.union([z.number().int().min(1).max(1000), z.enum(['normal', 'bold']), z.string().regex(/^[1-9]00$/)]).optional(),
     align: z.enum(['left', 'center', 'right', 'start', 'middle', 'end']).optional(),
+    maxWidth: number.positive().optional().describe('Wrap text to this width in pixels.'),
+    lineHeight: number.positive().max(10).optional().describe('Line spacing as a multiplier of font size; defaults to 1.2.'),
+    letterSpacing: number.optional().describe('Additional space between glyphs in pixels.'),
   }),
   z.strictObject({
     ...layerFields,
@@ -43,12 +56,15 @@ const layerSchema = z.discriminatedUnion('kind', [
     bounds: boxSchema.describe('Expected path bounds before translation and stroke expansion.'),
     offsetX: number.optional(),
     offsetY: number.optional(),
+    markerStart: z.enum(['arrow', 'circle']).optional(),
+    markerEnd: z.enum(['arrow', 'circle']).optional(),
   }),
   z.strictObject({
     ...layerFields,
     ...boxSchema.shape,
     kind: z.literal('raster'),
     src: z.string().max(8_000_000).describe('Embedded PNG or JPEG base64 data URL.'),
+    fit: z.enum(['contain', 'cover', 'stretch']).optional(),
   }),
   z.strictObject({
     ...layerFields,
@@ -60,12 +76,26 @@ const layerSchema = z.discriminatedUnion('kind', [
   }),
 ])
 
+const gradientFields = {
+  id: z.string().regex(/^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/),
+  stops: z.array(z.strictObject({ offset: number.min(0).max(1), color: paint, opacity: number.min(0).max(1).optional() })).min(2).max(32),
+}
+export const gradientSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...gradientFields, kind: z.literal('linear'), x1: number, y1: number, x2: number, y2: number }),
+  z.strictObject({ ...gradientFields, kind: z.literal('radial'), cx: number, cy: number, r: number.positive() }),
+])
+
 export const sceneSchema = z.strictObject({
   name: text,
   width: number,
   height: number,
   background: paint,
   layers: z.array(layerSchema).max(750),
+  gradients: z.array(gradientSchema).max(100).optional(),
+  provenance: z.discriminatedUnion('generator', [
+    z.strictObject({ generator: z.literal('diagram'), input: diagramSchema }),
+    z.strictObject({ generator: z.literal('plot'), input: plotSchema }),
+  ]).optional().describe('Validated source input at generation time. Subsequent layer edits do not rewrite this snapshot.'),
 })
 
 export const operationSchema = z.discriminatedUnion('op', [
@@ -74,6 +104,8 @@ export const operationSchema = z.discriminatedUnion('op', [
   z.strictObject({ op: z.literal('remove'), id: layerFields.id }),
   z.strictObject({ op: z.literal('move'), id: layerFields.id, x: number, y: number }),
   z.strictObject({ op: z.literal('update'), id: layerFields.id, patch: z.record(z.string(), z.unknown()) }),
+  z.strictObject({ op: z.literal('reorder'), id: layerFields.id, index: z.number().int().min(0).describe('Final zero-based position in back-to-front layer order.') }),
+  z.strictObject({ op: z.literal('gradients'), gradients: z.array(gradientSchema).max(100) }),
   z.strictObject({ op: z.literal('canvas'), name: text.optional(), width: number.optional(), height: number.optional(), background: paint.optional() }),
 ])
 
@@ -88,8 +120,8 @@ type MeshLayer = Extract<Layer, { kind: 'mesh' }>
 type RGB = [number, number, number]
 
 const canvasLimit = 8192
-const pathCommands = /^\s*[Mm][MmZzLlHhVvCcSsQqTtAaEe0-9\s,+.-]+$/
-const rasterDataUrl = /^data:image\/(?:png;base64,iVBORw0KGgo|jpeg;base64,\/9j\/)[A-Za-z0-9+/]+={0,2}$/
+const gradientReference = /^url\(#([a-zA-Z][a-zA-Z0-9_.-]{0,99})\)$/
+const pathBoundsCache = new Map<string, Box | undefined>()
 
 function rgb(color: string): RGB | undefined {
   if (color.toLowerCase() === 'white') return [255, 255, 255]
@@ -101,11 +133,35 @@ function rgb(color: string): RGB | undefined {
 }
 
 function validPaint(color: string): boolean {
-  return color === 'none' || color === 'transparent' || rgb(color) !== undefined
+  return color === 'none' || color === 'transparent' || rgb(color) !== undefined || gradientReference.test(color)
 }
 
 function validRaster(source: string): boolean {
-  return rasterDataUrl.test(source)
+  const match = source.match(/^data:image\/(png|jpeg);base64,([A-Za-z0-9+/]+={0,2})$/)
+  if (!match || match[2].length % 4 !== 0) return false
+  try {
+    const bytes = Uint8Array.from(atob(match[2]), (character) => character.charCodeAt(0))
+    if (match[1] === 'jpeg') {
+      return bytes.length > 100 && bytes[0] === 0xff && bytes[1] === 0xd8
+        && bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9
+    }
+    if (bytes.length < 57 || [137, 80, 78, 71, 13, 10, 26, 10].some((value, index) => bytes[index] !== value)) return false
+    const data = new DataView(bytes.buffer)
+    let offset = 8
+    let hasImage = false
+    while (offset + 12 <= bytes.length) {
+      const length = data.getUint32(offset)
+      const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8))
+      if (length > bytes.length - offset - 12) return false
+      if (offset === 8 && (type !== 'IHDR' || length !== 13 || !data.getUint32(16) || !data.getUint32(20))) return false
+      if (type === 'IDAT' && length) hasImage = true
+      if (type === 'IEND') return length === 0 && hasImage && offset + 12 === bytes.length
+      offset += length + 12
+    }
+    return false
+  } catch {
+    return false
+  }
 }
 
 function textAnchor(layer: TextLayer): 'start' | 'middle' | 'end' {
@@ -114,50 +170,79 @@ function textAnchor(layer: TextLayer): 'start' | 'middle' | 'end' {
   return 'start'
 }
 
-function textWidth(text: string, fontFamily = ''): number {
-  if (/^(?:["']?)(?:Courier(?: New)?|IBM Plex Mono|JetBrains Mono|Space Mono|ui-monospace|monospace)\b/i.test(fontFamily.trim())) {
-    return Array.from(text).length * 0.6
-  }
-  return [...text].reduce((width, glyph) => {
-    if (/[ilI.,|!':;\s]/.test(glyph)) return width + 0.28
-    if (/[MWmw@%]/.test(glyph)) return width + 0.88
-    return width + (/[^\u0000-\u00ff]/.test(glyph) ? 0.86 : 0.57)
-  }, 0)
+function pathBounds(d: string): Box | undefined {
+  if (pathBoundsCache.has(d)) return pathBoundsCache.get(d)
+  let box: Box | undefined
+  try {
+    const path = new SVGPathData(d)
+    if (path.commands.some((command) => command.type !== SVGPathData.MOVE_TO && command.type !== SVGPathData.CLOSE_PATH)) {
+      const { minX, minY, maxX, maxY } = path.getBounds()
+      if ([minX, minY, maxX, maxY].every(Number.isFinite)) box = { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+    }
+  } catch { /* Malformed path data is reported by verification. */ }
+  if (pathBoundsCache.size >= 512) pathBoundsCache.delete(pathBoundsCache.keys().next().value!)
+  pathBoundsCache.set(d, box)
+  return box
 }
 
-export function layerBounds(layer: Layer): Box {
+export function textLayout(layer: TextLayer) {
+  const anchor = textAnchor(layer)
+  return wrapText(layer.text, layer).map((text, index) => {
+    const width = measureText(text, layer)
+    const offset = anchor === 'middle' ? width / 2 : anchor === 'end' ? width : 0
+    return { text, x: layer.x - offset, y: layer.y + layer.fontSize * (layer.lineHeight ?? 1.2) * index, width }
+  })
+}
+
+function strokePadding(layer: Layer) {
+  return 'stroke' in layer && layer.stroke && layer.stroke !== 'none' && layer.stroke !== 'transparent' ? (layer.strokeWidth ?? 1) / 2 : 0
+}
+
+function rawLayerBounds(layer: Layer): Box {
   switch (layer.kind) {
     case 'ellipse': {
-      const padding = layer.stroke && rgb(layer.stroke) ? (layer.strokeWidth ?? 1) / 2 : 0
+      const padding = strokePadding(layer)
       return { x: layer.x - layer.rx - padding, y: layer.y - layer.ry - padding, width: (layer.rx + padding) * 2, height: (layer.ry + padding) * 2 }
     }
     case 'text': {
-      const lines = layer.text.split('\n')
-      const width = Math.max(...lines.map((line) => textWidth(line, layer.fontFamily))) * layer.fontSize
-      const anchor = textAnchor(layer)
-      const offset = anchor === 'middle' ? width / 2 : anchor === 'end' ? width : 0
-      return { x: layer.x - offset, y: layer.y - layer.fontSize * 0.82, width, height: layer.fontSize * (1 + (lines.length - 1) * 1.2) }
+      const boxes = textLayout(layer).map((line) => {
+        const ink = textInkBounds(line.text, layer)
+        return { x: line.x + ink.x, y: line.y + ink.y, width: ink.width, height: ink.height }
+      })
+      const x = Math.min(...boxes.map((box) => box.x))
+      const y = Math.min(...boxes.map((box) => box.y))
+      return { x, y, width: Math.max(...boxes.map((box) => box.x + box.width)) - x, height: Math.max(...boxes.map((box) => box.y + box.height)) - y }
     }
     case 'path': {
-      const { x, y, width, height } = layer.bounds
-      const padding = layer.stroke && rgb(layer.stroke) ? (layer.strokeWidth ?? 1) / 2 : 0
+      const { x, y, width, height } = pathBounds(layer.d) ?? layer.bounds
+      const marker = layer.markerStart || layer.markerEnd ? Math.max(6, (layer.strokeWidth ?? 1) * 4) : 0
+      const padding = Math.max(strokePadding(layer), marker)
       return { x: x + (layer.offsetX ?? 0) - padding, y: y + (layer.offsetY ?? 0) - padding, width: width + padding * 2, height: height + padding * 2 }
     }
     default:
-      return { x: layer.x, y: layer.y, width: layer.width, height: layer.height }
+      return { x: layer.x - strokePadding(layer), y: layer.y - strokePadding(layer), width: layer.width + 2 * strokePadding(layer), height: layer.height + 2 * strokePadding(layer) }
   }
 }
 
-type Issue = { id: string; checkId: string; layerId?: string; message: string; fixable: boolean }
-type Check = { id: string; label: string; status: 'pass' | 'fail'; detail: string }
+export function layerBounds(layer: Layer): Box {
+  const box = rawLayerBounds(layer)
+  if (!layer.rotationDeg) return box
+  const angle = layer.rotationDeg * Math.PI / 180
+  const width = Math.abs(box.width * Math.cos(angle)) + Math.abs(box.height * Math.sin(angle))
+  const height = Math.abs(box.width * Math.sin(angle)) + Math.abs(box.height * Math.cos(angle))
+  return { x: box.x + (box.width - width) / 2, y: box.y + (box.height - height) / 2, width, height }
+}
+
+type Issue = { id: string; checkId: string; layerId?: string; message: string; fixable: boolean; severity: 'error' | 'warning' }
+type Check = { id: string; label: string; status: 'pass' | 'fail' | 'warn'; detail: string }
 export type VerificationReport = { checks: Check[]; issues: Issue[]; passed: number; total: number }
 
 const checkDefinitions: ReadonlyArray<{ id: string; label: string; detail: string }> = [
-  { id: 'canvas', label: 'Canvas dimensions', detail: 'The artboard has supported dimensions and an opaque background.' },
-  { id: 'bounds', label: 'Layer bounds', detail: 'Visible layer bounds fit inside the artboard using declared path boxes and estimated text metrics.' },
+  { id: 'canvas', label: 'Canvas dimensions', detail: 'The artboard has supported dimensions and a valid background.' },
+  { id: 'bounds', label: 'Layer bounds', detail: 'Visible layer bounds fit inside the artboard using parsed paths and font metrics.' },
   { id: 'contrast', label: 'Text contrast', detail: 'Text meets contrast thresholds against sampled flat-color backgrounds.' },
   { id: 'labels', label: 'Layer names', detail: 'The artboard and every layer have names.' },
-  { id: 'assets', label: 'Raster references', detail: 'This check matches embedded PNG and JPEG signatures.' },
+  { id: 'assets', label: 'Raster references', detail: 'Embedded raster containers have valid structure; the export preflight decodes their content.' },
   { id: 'geometry', label: 'Shape geometry', detail: 'Layer dimensions and paints are valid.' },
   { id: 'visibility', label: 'Visible content', detail: 'The artboard contains visible layers.' },
   { id: 'unique', label: 'Unique layer IDs', detail: 'Each layer has a unique identifier.' },
@@ -181,7 +266,7 @@ function geometryProblem(layer: Layer): string | undefined {
     case 'text':
       return layer.fontSize <= 0 || !layer.text.trim() ? 'needs text and a positive font size' : undefined
     case 'path':
-      return !pathCommands.test(layer.d) || layer.bounds.width < 0 || layer.bounds.height < 0 ? 'has invalid path data or bounds' : undefined
+      return !pathBounds(layer.d) || layer.bounds.width < 0 || layer.bounds.height < 0 ? 'has invalid or empty path data or bounds' : undefined
     case 'mesh':
       return !rgb(layer.color) ? 'uses an unsupported surface color' : undefined
     default:
@@ -209,26 +294,31 @@ function contrast(foreground: RGB, background: RGB): number {
 
 function backdropAt(scene: Scene, index: number): RGB | undefined {
   const box = layerBounds(scene.layers[index])
-  const x = box.x + box.width / 2
-  const y = box.y + box.height / 2
+  const corners = [[box.x, box.y], [box.x + box.width, box.y], [box.x, box.y + box.height], [box.x + box.width, box.y + box.height]]
   for (let i = index - 1; i >= 0; i--) {
     const layer = scene.layers[i]
-    if (!layer.visible || layer.kind === 'text') continue
+    if (!layer.visible || layer.opacity === 0 || layer.kind === 'text') continue
     const under = layerBounds(layer)
-    if (x < under.x || y < under.y || x > under.x + under.width || y > under.y + under.height) continue
+    if (box.x + box.width < under.x || box.y + box.height < under.y || box.x > under.x + under.width || box.y > under.y + under.height) continue
+    if ('fill' in layer && (layer.fill === 'none' || layer.fill === 'transparent')) continue
+    if (layer.rotationDeg || (layer.opacity ?? 1) < 1) return undefined
 
     if (layer.kind === 'ellipse') {
-      if (((x - layer.x) / layer.rx) ** 2 + ((y - layer.y) / layer.ry) ** 2 > 1) continue
+      if (!corners.every(([x, y]) => ((x - layer.x) / layer.rx) ** 2 + ((y - layer.y) / layer.ry) ** 2 <= 1)) return undefined
       const fill = rgb(layer.fill)
       if (fill) return fill
+      if (gradientReference.test(layer.fill)) return undefined
     } else if (layer.kind === 'rect') {
       const radius = Math.min(layer.rx ?? 0, layer.width / 2, layer.height / 2)
-      const dx = x - Math.min(Math.max(x, layer.x + radius), layer.x + layer.width - radius)
-      const dy = y - Math.min(Math.max(y, layer.y + radius), layer.y + layer.height - radius)
-      if (dx * dx + dy * dy > radius * radius) continue
+      if (!corners.every(([x, y]) => {
+        const dx = x - Math.min(Math.max(x, layer.x + radius), layer.x + layer.width - radius)
+        const dy = y - Math.min(Math.max(y, layer.y + radius), layer.y + layer.height - radius)
+        return dx * dx + dy * dy <= radius * radius
+      })) return undefined
       const fill = rgb(layer.fill)
       if (fill) return fill
-    } else if (layer.kind !== 'path' || rgb(layer.fill)) {
+      if (gradientReference.test(layer.fill)) return undefined
+    } else if (layer.kind !== 'path' || (layer.fill !== 'none' && layer.fill !== 'transparent')) {
       return undefined
     }
   }
@@ -237,55 +327,75 @@ function backdropAt(scene: Scene, index: number): RGB | undefined {
 
 export function verifyScene(scene: Scene): VerificationReport {
   const issues: Issue[] = []
-  const record = (checkId: string, message: string, fixable: boolean, layerId?: string) => {
+  const record = (checkId: string, message: string, fixable: boolean, layerId?: string, severity: Issue['severity'] = 'error') => {
     const key = `${checkId}:${layerId ?? 'scene'}`
     const existing = issues.filter((issue) => issue.id === key || issue.id.startsWith(`${key}#`)).length
-    issues.push({ id: existing ? `${key}#${existing + 1}` : key, checkId, ...(layerId && { layerId }), message, fixable })
+    issues.push({ id: existing ? `${key}#${existing + 1}` : key, checkId, ...(layerId && { layerId }), message, fixable, severity })
   }
 
-  if (!validDimension(scene.width) || !validDimension(scene.height) || !rgb(scene.background)) {
-    record('canvas', `Use whole-pixel dimensions between 1 and ${canvasLimit} and a solid background color.`, true)
+  if (!validDimension(scene.width) || !validDimension(scene.height) || (!rgb(scene.background) && scene.background !== 'transparent' && scene.background !== 'none')) {
+    record('canvas', `Use whole-pixel dimensions between 1 and ${canvasLimit} and a solid or transparent background.`, true)
   }
   if (!scene.name.trim()) record('labels', 'Give the artboard a name.', true)
-  if (!scene.layers.some((layer) => layer.visible)) record('visibility', 'The artboard has no visible layers.', scene.layers.length > 0)
+  if (!scene.layers.some((layer) => layer.visible && layer.opacity !== 0)) record('visibility', 'The artboard has no visible layers.', scene.layers.length > 0)
+
+  const gradients = new Set<string>()
+  for (const gradient of scene.gradients ?? []) {
+    if (gradients.has(gradient.id)) record('unique', `Gradient ID “${gradient.id}” is already in use.`, false)
+    gradients.add(gradient.id)
+    if (gradient.stops.some((stop) => !rgb(stop.color))) record('geometry', `Gradient “${gradient.id}” has an invalid stop color.`, false)
+    if (gradient.stops.some((stop, index) => index > 0 && stop.offset < gradient.stops[index - 1].offset)) {
+      record('geometry', `Gradient “${gradient.id}” stops must be ordered by offset.`, false)
+    }
+  }
 
   const layerIds = new Set<string>()
-  let unsampledText = 0
   scene.layers.forEach((layer, index) => {
     const name = layer.name.trim() || layer.id
     if (layerIds.has(layer.id)) record('unique', `Layer ID “${layer.id}” is already in use.`, false, layer.id)
     layerIds.add(layer.id)
     if (!layer.name.trim()) record('labels', `Layer “${layer.id}” has no name.`, true, layer.id)
-    if (layer.kind === 'raster' && !validRaster(layer.src)) record('assets', `“${name}” needs an embedded PNG or JPEG data URL.`, false, layer.id)
+    if (layer.kind === 'raster' && !validRaster(layer.src)) record('assets', `“${name}” needs a complete embedded PNG or JPEG image.`, false, layer.id)
     const problem = geometryProblem(layer)
     if (problem) record('geometry', `“${name}” ${problem}.`, false, layer.id)
-    if (!layer.visible || problem) return
+    for (const color of ['fill' in layer ? layer.fill : '', 'stroke' in layer ? layer.stroke ?? '' : '']) {
+      const reference = color.match(gradientReference)?.[1]
+      if (reference && !gradients.has(reference)) record('geometry', `“${name}” references missing gradient “${reference}”.`, false, layer.id)
+    }
+    if (!layer.visible || layer.opacity === 0 || problem) return
 
     const box = layerBounds(layer)
     if (validDimension(scene.width) && validDimension(scene.height) && outOfBounds(scene, box)) {
       record('bounds', `“${name}” extends outside the artboard.`, box.width <= scene.width && box.height <= scene.height, layer.id)
     }
     if (layer.kind !== 'text') return
+    if (!textMetrics(layer).measured) {
+      record('bounds', `“${name}” uses estimated text bounds because its bundled font has not loaded.`, false, layer.id, 'warning')
+    }
+    const missing = missingGlyphs(layer.text, layer)
+    if (missing.length) record('geometry', `“${name}” uses glyphs absent from ${normalizeFontFamily(layer.fontFamily)}: ${missing.join(' ')}.`, false, layer.id)
+    if (needsComplexShaping(layer.text)) {
+      record('geometry', `“${name}” needs text shaping review: combining marks or bidirectional scripts exceed the portable renderer's simple glyph layout.`, false, layer.id, 'warning')
+    }
 
     const background = backdropAt(scene, index)
-    if (!background) {
-      unsampledText++
+    const foreground = rgb(layer.fill)
+    if (!background || !foreground || (layer.opacity ?? 1) < 1) {
+      record('contrast', `“${name}” needs rendered contrast review because its paint or background cannot be sampled as a solid color.`, false, layer.id, 'warning')
       return
     }
-    const foreground = rgb(layer.fill)
-    const ratio = foreground ? contrast(foreground, background) : 1
+    const ratio = contrast(foreground, background)
     const bold = layer.fontWeight === 'bold' || Number(layer.fontWeight) >= 700
     const minimum = layer.fontSize >= 24 || (bold && layer.fontSize >= 18.66) ? 3 : 4.5
     if (ratio < minimum) {
-      record('contrast', `“${name}” has ${ratio.toFixed(2)}:1 contrast at its center and needs ${minimum}:1.`, true, layer.id)
+      record('contrast', `“${name}” has ${ratio.toFixed(2)}:1 contrast against its solid backdrop and needs ${minimum}:1.`, true, layer.id)
     }
   })
 
   const checks = checkDefinitions.map<Check>((definition) => {
-    const count = issues.filter((issue) => issue.checkId === definition.id).length
-    const status = count ? 'fail' : 'pass'
-    let detail = count ? `${count} ${count === 1 ? 'issue' : 'issues'} found.` : definition.detail
-    if (definition.id === 'contrast' && unsampledText) detail += ` ${unsampledText} ${unsampledText === 1 ? 'layer uses' : 'layers use'} a background this check can't sample.`
+    const findings = issues.filter((issue) => issue.checkId === definition.id)
+    const status = findings.some((issue) => issue.severity === 'error') ? 'fail' : findings.length ? 'warn' : 'pass'
+    const detail = findings.length ? `${findings.length} ${status === 'warn' ? 'review items' : 'issues'} found.` : definition.detail
     return { ...definition, status, detail }
   })
   return { checks, issues, passed: checks.filter((check) => check.status === 'pass').length, total: checks.length }
@@ -315,7 +425,7 @@ export function repairScene(original: Scene): { scene: Scene; report: Verificati
     scene.height = clamp(Math.round(scene.height), 1, canvasLimit)
     changes.push(`Set the artboard dimensions to ${scene.width} × ${scene.height}.`)
   }
-  if (!rgb(scene.background)) {
+  if (!rgb(scene.background) && scene.background !== 'none' && scene.background !== 'transparent') {
     scene.background = '#ffffff'
     changes.push('Set the artboard background to white.')
   }
@@ -324,8 +434,8 @@ export function repairScene(original: Scene): { scene: Scene; report: Verificati
     changes.push('Named the artboard.')
   }
   const first = scene.layers[0]
-  if (first && !scene.layers.some((layer) => layer.visible)) {
-    scene.layers[0] = { ...first, visible: true }
+  if (first && !scene.layers.some((layer) => layer.visible && layer.opacity !== 0)) {
+    scene.layers[0] = { ...first, visible: true, opacity: first.opacity === 0 ? 1 : first.opacity }
     changes.push(`Showed “${first.name || first.id}”.`)
   }
 
@@ -350,7 +460,7 @@ export function repairScene(original: Scene): { scene: Scene; report: Verificati
     return layer
   })
 
-  const contrastLayers = new Set(verifyScene(scene).issues.filter((issue) => issue.checkId === 'contrast').map((issue) => issue.layerId))
+  const contrastLayers = new Set(verifyScene(scene).issues.filter((issue) => issue.checkId === 'contrast' && issue.fixable).map((issue) => issue.layerId))
   scene.layers = scene.layers.map((layer, index) => {
     if (layer.kind !== 'text' || !layer.visible || !contrastLayers.has(layer.id)) return layer
     const background = backdropAt(scene, index)
@@ -368,6 +478,10 @@ export function applyOperations(original: Scene, operations: readonly unknown[])
   let scene = { ...original, layers: [...original.layers] }
 
   for (const operation of parsed) {
+    if (operation.op === 'gradients') {
+      scene = { ...scene, gradients: operation.gradients }
+      continue
+    }
     if (operation.op === 'canvas') {
       const { name, width, height, background } = operation
       scene = { ...scene, name: name ?? scene.name, width: width ?? scene.width, height: height ?? scene.height, background: background ?? scene.background }
@@ -396,6 +510,11 @@ export function applyOperations(original: Scene, operations: readonly unknown[])
       case 'update':
         if ('id' in operation.patch || 'kind' in operation.patch) throw new Error('An update cannot change a layer’s ID or kind.')
         scene.layers[index] = layerSchema.parse({ ...layer, ...operation.patch })
+        break
+      case 'reorder':
+        if (operation.index >= scene.layers.length) throw new Error('The target layer position is outside the layer list.')
+        scene.layers.splice(index, 1)
+        scene.layers.splice(operation.index, 0, layer)
         break
     }
   }
@@ -487,32 +606,69 @@ function meshSvg(layer: MeshLayer): string {
   }).join('')
 }
 
-function layerSvg(layer: Layer): string {
-  if (geometryProblem(layer)) return ''
-  const stroke = 'stroke' in layer && layer.stroke ? ` stroke="${xml(layer.stroke)}" stroke-width="${layer.strokeWidth ?? 1}"` : ''
+function layerSvg(layer: Layer, index: number, outlineText: boolean): string {
+  const problem = geometryProblem(layer)
+  if (problem) throw new Error(`Cannot render “${layer.name || layer.id}”: it ${problem}.`)
+  let stroke = 'stroke' in layer && layer.stroke ? ` stroke="${xml(layer.stroke)}" stroke-width="${layer.strokeWidth ?? 1}"` : ''
+  if ('strokeDasharray' in layer && layer.strokeDasharray) stroke += ` stroke-dasharray="${layer.strokeDasharray.join(' ')}"`
+  if ('strokeLinecap' in layer && layer.strokeLinecap) stroke += ` stroke-linecap="${layer.strokeLinecap}"`
   switch (layer.kind) {
     case 'rect':
-      return `<rect x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" rx="${layer.rx ?? 0}" fill="${xml(layer.fill)}"/>`
+      return `<rect x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" rx="${layer.rx ?? 0}" fill="${xml(layer.fill)}"${stroke}/>`
     case 'ellipse':
       return `<ellipse cx="${layer.x}" cy="${layer.y}" rx="${layer.rx}" ry="${layer.ry}" fill="${xml(layer.fill)}"${stroke}/>`
     case 'text': {
-      const lines = layer.text.split('\n')
-      const content = lines.length === 1 ? xml(lines[0]) : lines.map((line, index) => `<tspan x="${layer.x}" y="${layer.y + layer.fontSize * 1.2 * index}">${xml(line)}</tspan>`).join('')
-      return `<text x="${layer.x}" y="${layer.y}" fill="${xml(layer.fill)}" font-size="${layer.fontSize}" font-family="${xml(layer.fontFamily ?? 'Inter, sans-serif')}" font-weight="${layer.fontWeight ?? 'normal'}" text-anchor="${textAnchor(layer)}" xml:space="preserve">${content}</text>`
+      const lines = textLayout(layer)
+      if (outlineText) {
+        if (!textMetrics(layer).measured) throw new Error(`Load the bundled ${normalizeFontFamily(layer.fontFamily)} font before outlining text.`)
+        if (missingGlyphs(layer.text, layer).length) throw new Error(`“${layer.name}” contains glyphs missing from its font.`)
+        return `<g aria-label="${xml(layer.text)}" fill="${xml(layer.fill)}">${lines.map((line) => `<path d="${textOutline(line.text, layer, line.x, line.y) ?? ''}"/>`).join('')}</g>`
+      }
+      const content = lines.map((line) => `<tspan x="${line.x}" y="${line.y}">${xml(line.text)}</tspan>`).join('')
+      return `<text fill="${xml(layer.fill)}" font-size="${layer.fontSize}" font-family="${normalizeFontFamily(layer.fontFamily)}" font-weight="${layer.fontWeight ?? 'normal'}" letter-spacing="${layer.letterSpacing ?? 0}" font-variant-ligatures="none" text-anchor="start" xml:space="preserve">${content}</text>`
     }
-    case 'path':
-      return `<path d="${xml(layer.d)}" fill="${xml(layer.fill)}"${stroke} stroke-linejoin="round" transform="translate(${layer.offsetX ?? 0} ${layer.offsetY ?? 0})"/>`
-    case 'raster':
-      return validRaster(layer.src) ? `<image x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" href="${xml(layer.src)}" preserveAspectRatio="xMidYMid meet"/>` : ''
+    case 'path': {
+      const markers = (['Start', 'End'] as const).filter((side) => layer[`marker${side}`]).map((side) => ` marker-${side.toLowerCase()}="url(#__grapher_${index}_${side})"`).join('')
+      return `<path d="${xml(layer.d)}" fill="${xml(layer.fill)}"${stroke}${markers} stroke-linejoin="round" transform="translate(${layer.offsetX ?? 0} ${layer.offsetY ?? 0})"/>`
+    }
+    case 'raster': {
+      if (!validRaster(layer.src)) throw new Error(`Cannot render incomplete raster “${layer.name || layer.id}”.`)
+      const aspect = layer.fit === 'stretch' ? 'none' : layer.fit === 'cover' ? 'xMidYMid slice' : 'xMidYMid meet'
+      return `<image x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" href="${xml(layer.src)}" preserveAspectRatio="${aspect}"/>`
+    }
     case 'mesh':
       return meshSvg(layer)
   }
 }
 
-export function sceneSvg(scene: Scene): string {
+export function sceneSvg(scene: Scene, options: { outlineText?: boolean } = {}): string {
+  const invalid = verifyScene(scene).issues.find((issue) => issue.severity === 'error' && ['geometry', 'assets', 'unique', 'canvas'].includes(issue.checkId))
+  if (invalid) throw new Error(`Cannot render scene: ${invalid.message}`)
   const width = clamp(Math.round(scene.width), 1, canvasLimit)
   const height = clamp(Math.round(scene.height), 1, canvasLimit)
-  const background = rgb(scene.background) ? scene.background : '#ffffff'
-  const layers = scene.layers.filter((layer) => layer.visible).map((layer) => `<g data-layer-id="${xml(layer.id)}">${layerSvg(layer)}</g>`).join('')
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" overflow="hidden"><title>${xml(scene.name)}</title><rect width="100%" height="100%" fill="${xml(background)}"/>${layers}</svg>`
+  const background = rgb(scene.background) ? scene.background : scene.background === 'transparent' || scene.background === 'none' ? 'none' : '#ffffff'
+  const gradients = (scene.gradients ?? []).map((gradient) => {
+    const stops = gradient.stops.map((stop) => `<stop offset="${stop.offset}" stop-color="${xml(stop.color)}" stop-opacity="${stop.opacity ?? 1}"/>`).join('')
+    if (gradient.kind === 'linear') return `<linearGradient id="${gradient.id}" x1="${gradient.x1}" y1="${gradient.y1}" x2="${gradient.x2}" y2="${gradient.y2}">${stops}</linearGradient>`
+    return `<radialGradient id="${gradient.id}" cx="${gradient.cx}" cy="${gradient.cy}" r="${gradient.r}">${stops}</radialGradient>`
+  }).join('')
+  const markers = scene.layers.map((layer, index) => {
+    if (layer.kind !== 'path') return ''
+    const size = Math.max(6, (layer.strokeWidth ?? 1) * 4)
+    return (['Start', 'End'] as const).filter((side) => layer[`marker${side}`]).map((side) => {
+      // Explicitly reverse start arrows: SVG 1.1 renderers do not implement auto-start-reverse.
+      const base = side === 'Start' ? size : -size
+      const geometry = layer[`marker${side}`] === 'circle'
+        ? `<circle cx="0" cy="0" r="${size / 3}"/>`
+        : `<path d="M ${base} ${-size * 0.45} L 0 0 L ${base} ${size * 0.45} Z"/>`
+      return `<marker id="__grapher_${index}_${side}" markerUnits="userSpaceOnUse" markerWidth="${size * 2}" markerHeight="${size * 2}" refX="0" refY="0" viewBox="${-size} ${-size} ${size * 2} ${size * 2}" orient="auto" overflow="visible" fill="${xml(layer.stroke ?? '#000000')}">${geometry}</marker>`
+    }).join('')
+  }).join('')
+  const layers = scene.layers.map((layer, index) => {
+    if (!layer.visible || layer.opacity === 0) return ''
+    const box = rawLayerBounds(layer)
+    const transform = layer.rotationDeg ? ` transform="rotate(${layer.rotationDeg} ${box.x + box.width / 2} ${box.y + box.height / 2})"` : ''
+    return `<g data-layer-id="${xml(layer.id)}" data-layer-kind="${layer.kind}" opacity="${layer.opacity ?? 1}"${transform}>${layerSvg(layer, index, options.outlineText ?? false)}</g>`
+  }).join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" overflow="hidden"><title>${xml(scene.name)}</title><defs>${gradients}${markers}</defs><rect width="100%" height="100%" fill="${xml(background)}"/>${layers}</svg>`
 }

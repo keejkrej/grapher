@@ -1,0 +1,16 @@
+{
+  "title": "From sample to result",
+  "subtitle": "An editable workflow. Replace the labels and criteria with your study protocol.",
+  "theme": "paper",
+  "nodes": [
+    { "id": "sample", "label": "Collect samples", "description": "Record sample identity and handling." },
+    { "id": "qc", "label": "Quality control", "description": "Apply prespecified criteria.", "shape": "diamond" },
+    { "id": "analyze", "label": "Analyze", "description": "Use the planned analysis method." },
+    { "id": "report", "label": "Report", "description": "Present estimates and uncertainty." }
+  ],
+  "edges": [
+    { "from": "sample", "to": "qc" },
+    { "from": "qc", "to": "analyze", "label": "criteria met" },
+    { "from": "analyze", "to": "report" }
+  ]
+}
