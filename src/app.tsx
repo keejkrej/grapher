@@ -169,6 +169,7 @@ export function App() {
   const consoleInput = useRef<HTMLTextAreaElement>(null);
   const textInput = useRef<HTMLTextAreaElement>(null);
   const artboard = useRef<HTMLDivElement>(null);
+  const keyboardMenuAnchor = useRef<HTMLSpanElement>(null);
   const drag = useRef<{ x: number; y: number } | undefined>(undefined);
   const { scene, revision, report } = workspace;
   const selectedLayer = scene.layers.find((layer) => layer.id === selected);
@@ -676,7 +677,13 @@ export function App() {
                 onKeyDown={(event) => {
                   if (!isTextInput(event.target) && ((event.shiftKey && event.key === 'F10') || event.key === 'ContextMenu')) {
                     event.preventDefault(); event.stopPropagation();
-                    event.currentTarget.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 0 }));
+                    const board = event.currentTarget.getBoundingClientRect();
+                    const anchor = keyboardMenuAnchor.current;
+                    if (!anchor) return;
+                    // The SDK anchors keyboard context menus to the event target, overriding MenuContent.anchor.
+                    anchor.style.left = `${Math.max(12, Math.min(window.innerWidth - 12, board.left + (bounds?.x ?? 0) * scale)) - board.left}px`;
+                    anchor.style.top = `${Math.max(12, Math.min(window.innerHeight - 12, board.top + ((bounds?.y ?? 0) + (bounds?.height ?? 0)) * scale)) - board.top}px`;
+                    anchor.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 0 }));
                   }
                 }}
                 onContextMenuCapture={(event) => {
@@ -686,6 +693,7 @@ export function App() {
                   else if (event.clientX || event.clientY) setSelected(undefined);
                 }}>
                 <div className="artwork" dangerouslySetInnerHTML={{ __html: art }} />
+                <span ref={keyboardMenuAnchor} className="keyboard-menu-anchor" aria-hidden="true" />
                 {bounds && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }}>
                   {!interaction.editing && !selectedLayer?.rotationDeg && tool === 'select' && (['nw', 'ne', 'se', 'sw'] as const).map((corner) =>
                     <button key={corner} type="button" className={`resize-handle handle-${corner}`} data-resize-handle={corner}
@@ -711,7 +719,8 @@ export function App() {
                   </span></div>
                 </div>}
               </MenuContextTrigger>
-              <MenuContent className="pop-menu canvas-context-menu" aria-label="Selection actions" sideOffset={4} finalFocus={() => artboard.current}>
+              <MenuContent className="pop-menu canvas-context-menu" aria-label="Selection actions"
+                side="bottom" align="start" sideOffset={4} collisionPadding={12} finalFocus={() => artboard.current}>
                 <div className="menu-caption">{selectedLayer?.name ?? 'Select an element'}</div>
                 <MenuItem value="text" label="Edit text" disabled={working || selectedLayer?.kind !== 'text'}><Type size={14} /> Edit text</MenuItem>
                 <MenuItem value="duplicate" label="Duplicate" shortcut="mod+d" disabled={working || !selectedLayer}><Copy size={14} /> Duplicate</MenuItem>

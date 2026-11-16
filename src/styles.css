@@ -168,7 +168,8 @@ strong { font-weight: 650; }
 .handle-ne { top: -5px; right: -5px; cursor: nesw-resize; }
 .handle-se { bottom: -5px; right: -5px; cursor: nwse-resize; }
 .handle-sw { bottom: -5px; left: -5px; cursor: nesw-resize; }
-.canvas-context-menu { min-width: 220px; }
+.canvas-context-menu { min-width: 220px; max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); overflow-y: auto; }
+.keyboard-menu-anchor { position: absolute; width: 0; height: 0; pointer-events: none; }
 .canvas-context-menu [role="menuitem"] { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 5px; font-size: 12px; }
 .canvas-context-menu [role="menuitem"]:not([data-disabled]):is(:hover, [data-highlighted]) { background: #f3f2ed; }
 .canvas-context-menu [data-destructive] { color: #a04532; }
