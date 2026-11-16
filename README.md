@@ -1,6 +1,6 @@
 # Grapher
 
-Grapher is a local graphics workspace for agents. Agents create editable scenes, check their structure and rendered output, and revise the same saved document. The first quality focus is diagrams and scientific figures; use cases are sample content, not application modes.
+Grapher is a local graphics workspace for agents with direct human editing. Agents create editable scenes, check their structure and rendered output, and revise the same saved document that people manipulate on the canvas. The first quality focus is diagrams and scientific figures; use cases are sample content, not application modes.
 
 ![Scientific plot in the Grapher studio](docs/assets/studio.png)
 
@@ -19,6 +19,25 @@ Open [the studio](http://localhost:5173). `npm start` serves the built applicati
 The document menu creates blank documents, duplicates existing work, imports scene JSON, and opens samples. Samples create separate documents. **History** restores any saved revision as a new revision. Undo and redo are available for the current editing session. The selected document persists in the URL and local browser storage.
 
 Documents and their complete revision history persist in `.grapher/workspace.sqlite`. `GRAPHER_DATA_DIR` selects a different data directory. SQLite transactions protect atomic edits and revision checks across concurrent connections. For a complete backup, stop the server and copy the data directory; JSON export preserves an individual scene without its history.
+
+## Human and agent collaboration
+
+| Interaction | Behavior |
+| --- | --- |
+| Click and drag an element | Move it with a live preview; release to save one edit. Escape cancels. |
+| Double-click text | Edit its actual text source. Enter saves, Shift+Enter adds a line, Escape cancels. |
+| Right-click an element | Edit text, duplicate, change stacking order, delete, or ask the agent about the selection. Shift+F10 also opens actions. |
+| Drag a corner handle | Resize; Shift preserves proportions. Text scales proportionally. Reset rotation before resizing a rotated layer. |
+| Arrow keys / Shift+arrow | Nudge by 1 / 10 scene pixels. |
+| Ctrl/Cmd+D; Delete | Duplicate or delete the selected element. Text fields keep their normal keyboard behavior. |
+| Ctrl/Cmd+Z; Ctrl/Cmd+Shift+Z | Undo or redo local edits. History includes saved agent changes too. |
+| Inspector | Edit exact position, dimensions, text size, content and colors. |
+
+The console shows the selected element as request context. **Ask agent about selection** opens it with that focus, and the server validates the selection against the target document. People can make precise corrections and hand the same editable artifact back to an agent.
+
+![Direct editing and selection actions](docs/assets/human-editing.png)
+
+Human gestures and agent tools share the revision system. A concurrent edit cannot silently overwrite newer work. Rejected text saves retain the draft; if another revision conflicts, the editor keeps a copyable draft. Original generator inputs remain a provenance snapshot after manual changes. Direct manipulation currently focuses on individual layers; grouping and multiple selection are not implemented.
 
 ## Agent workflow
 

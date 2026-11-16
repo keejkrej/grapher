@@ -668,7 +668,7 @@ export function sceneSvg(scene: Scene, options: { outlineText?: boolean } = {}):
     if (!layer.visible || layer.opacity === 0) return ''
     const box = rawLayerBounds(layer)
     const transform = layer.rotationDeg ? ` transform="rotate(${layer.rotationDeg} ${box.x + box.width / 2} ${box.y + box.height / 2})"` : ''
-    return `<g data-layer-id="${xml(layer.id)}" opacity="${layer.opacity ?? 1}"${transform}>${layerSvg(layer, index, options.outlineText ?? false)}</g>`
+    return `<g data-layer-id="${xml(layer.id)}" data-layer-kind="${layer.kind}" opacity="${layer.opacity ?? 1}"${transform}>${layerSvg(layer, index, options.outlineText ?? false)}</g>`
   }).join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" overflow="hidden"><title>${xml(scene.name)}</title><defs>${gradients}${markers}</defs><rect width="100%" height="100%" fill="${xml(background)}"/>${layers}</svg>`
 }

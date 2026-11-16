@@ -2,7 +2,7 @@ import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
 import type { UIMessage } from 'ai';
 import { Button } from '@ui-sdk/react/button';
-import { Menu, MenuContent, MenuGroup, MenuGroupLabel, MenuItem, MenuTrigger } from '@ui-sdk/react/menu';
+import { Menu, MenuContent, MenuContextTrigger, MenuGroup, MenuGroupLabel, MenuItem, MenuSeparator, MenuTrigger } from '@ui-sdk/react/menu';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@ui-sdk/react/tabs';
 import {
   ArrowDownToLine, ArrowUp, Box, Braces, Check, ChevronDown, Circle, CircleAlert, CircleCheck, CodeXml, Crosshair,
@@ -12,7 +12,9 @@ import {
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, PointerEvent, ReactNode } from 'react';
 import { layerBounds, sceneSvg, verifyScene } from './engine';
-import type { Layer, Scene } from './engine';
+import type { Layer, Operation, Scene } from './engine';
+import { duplicateLayers } from './interaction';
+import { isTextInput, useCanvasInteractions } from './use-canvas-interactions';
 import { examples, initialExample } from './examples';
 import { useGrapherTools } from './webmcp';
 import { workspaceClient } from './workspace-client';
@@ -145,6 +147,7 @@ export function App() {
   const [inspector, setInspector] = useState<'verify' | 'properties' | 'history'>('verify');
   const [mode, setMode] = useState<'canvas' | 'mesh' | 'source'>('canvas');
   const [menu, setMenu] = useState<'documents' | 'export'>();
+  const [contextOpen, setContextOpen] = useState(false);
   const [tool, setTool] = useState<'select' | 'pan'>('select');
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -158,11 +161,14 @@ export function App() {
   const [future, setFuture] = useState<Scene[]>([]);
   const [propertyReset, setPropertyReset] = useState(0);
   const latest = useRef(starter);
+  const mutationBusy = useRef(false);
   const activeDocument = useRef(documentId);
   const importInput = useRef<HTMLInputElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const feed = useRef<HTMLDivElement>(null);
   const consoleInput = useRef<HTMLTextAreaElement>(null);
+  const textInput = useRef<HTMLTextAreaElement>(null);
+  const artboard = useRef<HTMLDivElement>(null);
   const drag = useRef<{ x: number; y: number } | undefined>(undefined);
   const { scene, revision, report } = workspace;
   const selectedLayer = scene.layers.find((layer) => layer.id === selected);
@@ -171,10 +177,8 @@ export function App() {
   const issueCount = report.issues.length;
   const needsReview = report.checks.some((check) => check.status === 'warn');
   const allPassed = report.passed === report.total;
-  const art = useMemo(() => sceneSvg(scene, { outlineText: true }), [scene]);
   const fit = Math.min(1, Math.max(0.15, (size.width - 90) / scene.width), Math.max(0.15, (size.height - 110) / scene.height));
   const scale = fit * zoom;
-  const bounds = selectedLayer?.visible ? layerBounds(selectedLayer) : undefined;
 
   const rememberSummary = useCallback((next: Workspace) => {
     const summary = documentSummary(next);
@@ -234,6 +238,24 @@ export function App() {
     onFinish: () => { void refresh(); },
   });
   const running = status === 'submitted' || status === 'streaming';
+  const interaction = useCanvasInteractions({
+    workspace, selected, scale, enabled: !!revision && !working && mode === 'canvas' && tool === 'select' && !contextOpen,
+    keyboardEnabled: !!revision && mode === 'canvas' && tool === 'select' && !contextOpen,
+    select: setSelected,
+    commit: (operations, base) => mutate({ action: 'apply', operations }, true, base),
+    undo: () => { void travel('undo'); }, redo: () => { void travel('redo'); },
+    duplicate: () => { void duplicateSelection(); }, remove: () => { void deleteSelection(); },
+    notify: (message) => setNotice({ message, error: true }),
+  });
+  const preview = interaction.preview && interaction.preview.documentId === documentId ? interaction.preview.layer : undefined;
+  const displayScene = useMemo(() => preview ? { ...scene, layers: scene.layers.map((layer) => layer.id === preview.id ? preview : layer) } : scene, [scene, preview]);
+  const art = useMemo(() => sceneSvg(displayScene, { outlineText: true }), [displayScene]);
+  const shownSelection = preview?.id === selected ? preview : selectedLayer;
+  const bounds = shownSelection?.visible ? layerBounds(shownSelection) : undefined;
+
+  useEffect(() => {
+    if (interaction.editing) { textInput.current?.focus(); textInput.current?.select(); }
+  }, [interaction.editing?.layer.id]);
 
   useEffect(() => {
     if (!hasMesh && mode === 'mesh') setMode('canvas');
@@ -305,24 +327,15 @@ export function App() {
     if (feed.current) feed.current.scrollTop = feed.current.scrollHeight;
   }, [messages, consoleOpen, status]);
 
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        setSelected(undefined);
-      }
-    }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
-
-  async function mutate(input: Parameters<typeof client.edit>[0], remember = true) {
-    if (working || !revision) return;
+  async function mutate(input: Parameters<typeof client.edit>[0], remember = true, base = workspace) {
+    if (mutationBusy.current || !base.revision || base.documentId !== activeDocument.current) return;
+    mutationBusy.current = true;
     setWorking(true);
     try {
-      const next = await client.edit({ ...input, revision });
+      const next = await workspaceClient(location.origin, base.documentId).edit({ ...input, documentId: base.documentId, revision: base.revision });
       if (!accept(next, true)) return;
-      if (next.revision !== revision && remember) {
-        setPast((history) => [...history.slice(-19), scene]);
+      if (next.revision !== base.revision && remember) {
+        setPast((history) => [...history.slice(-19), base.scene]);
         setFuture([]);
       }
       return next;
@@ -333,6 +346,7 @@ export function App() {
         void refresh();
       }
     } finally {
+      mutationBusy.current = false;
       setWorking(false);
     }
   }
@@ -357,7 +371,8 @@ export function App() {
   }
 
   async function createDocument(input: Parameters<typeof client.create>[0]) {
-    if (working || !documentsReady) return;
+    if (working || mutationBusy.current || !documentsReady) return;
+    mutationBusy.current = true;
     setWorking(true);
     try {
       const next = await client.create(input);
@@ -369,6 +384,7 @@ export function App() {
     } catch (error) {
       setNotice({ message: error instanceof Error ? error.message : 'Could not create the document.', error: true });
     } finally {
+      mutationBusy.current = false;
       setWorking(false);
     }
   }
@@ -404,7 +420,8 @@ export function App() {
   }
 
   async function restoreRevision(targetRevision: number) {
-    if (working || !revision) return;
+    if (working || mutationBusy.current || !revision) return;
+    mutationBusy.current = true;
     setWorking(true);
     try {
       const next = await client.restore(targetRevision, revision);
@@ -422,6 +439,7 @@ export function App() {
         void refresh();
       }
     } finally {
+      mutationBusy.current = false;
       setWorking(false);
     }
   }
@@ -464,10 +482,52 @@ export function App() {
     return mutate({ action: 'apply', operations: [{ op: 'update', id: layer.id, patch }] });
   }
 
-  function pick(event: MouseEvent<HTMLDivElement>) {
-    if (tool === 'pan') return;
-    const element = (event.target as Element).closest('[data-layer-id]');
-    setSelected(element?.getAttribute('data-layer-id') ?? undefined);
+  function layerAt(target: EventTarget | null) {
+    const id = target instanceof Element ? target.closest('[data-layer-id]')?.getAttribute('data-layer-id') : undefined;
+    return scene.layers.find((layer) => layer.id === id);
+  }
+
+  function canvasPointerDown(event: PointerEvent<HTMLDivElement>) {
+    if (tool !== 'select' || event.button !== 0 || (event.target as Element).closest('[data-canvas-editor], [data-resize-handle]')) return;
+    const layer = layerAt(event.target);
+    if (layer) { setInspector('properties'); interaction.begin(event, layer); }
+    else if (!interaction.editing) { setSelected(undefined); artboard.current?.focus({ preventScroll: true }); }
+  }
+
+  function canvasDoubleClick(event: MouseEvent<HTMLDivElement>) {
+    if (tool !== 'select') return;
+    const layer = layerAt(event.target) ?? layerAt(document.elementFromPoint(event.clientX, event.clientY));
+    if (layer?.kind === 'text') { event.preventDefault(); interaction.beginText(layer); }
+  }
+
+  async function deleteSelection() {
+    if (!selectedLayer) return;
+    if (await mutate({ action: 'apply', operations: [{ op: 'remove', id: selectedLayer.id }] })) setSelected(undefined);
+  }
+
+  async function duplicateSelection() {
+    if (!selectedLayer) return;
+    const operations = duplicateLayers(scene, [selectedLayer.id]);
+    if (await mutate({ action: 'apply', operations })) {
+      const copy = operations.find((operation) => operation.op === 'add');
+      if (copy?.op === 'add') setSelected(copy.layer.id);
+    }
+  }
+
+  async function layerAction(action: string) {
+    if (!selectedLayer) return;
+    if (action === 'text') {
+      setContextOpen(false);
+      window.requestAnimationFrame(() => interaction.beginText(selectedLayer));
+    } else if (action === 'duplicate') await duplicateSelection();
+    else if (action === 'delete') await deleteSelection();
+    else if (action === 'front' || action === 'back') {
+      const operation: Operation = { op: 'reorder', id: selectedLayer.id, index: action === 'front' ? scene.layers.length - 1 : 0 };
+      await mutate({ action: 'apply', operations: [operation] });
+    } else if (action === 'agent') {
+      setConsoleOpen(true);
+      window.requestAnimationFrame(() => consoleInput.current?.focus());
+    }
   }
 
   function panStart(event: PointerEvent<HTMLDivElement>) {
@@ -491,7 +551,7 @@ export function App() {
     const text = value.trim();
     if (!text || running || !revision || !documentId) return;
     setBrief('');
-    void sendMessage({ text }, { body: { documentId, revision } }).catch(() => {});
+    void sendMessage({ text }, { body: { documentId, revision, selectedLayerIds: selectedLayer ? [selectedLayer.id] : [] } }).catch(() => {});
   }
 
   const library = samples.map(({ key, name }) =>
@@ -608,10 +668,60 @@ export function App() {
           onPointerCancel={() => { drag.current = undefined; }}>
           {mode === 'canvas' && <div className="board-wrap" style={{ width: scene.width * scale, transform: `translate(${offset.x}px, ${offset.y}px)` }}>
             <div className="board-meta"><span><Crosshair size={13} /> {scene.name}</span><span>{scene.width} × {scene.height}</span></div>
-            <div className="artboard" style={{ height: scene.height * scale }} onClick={pick}>
-              <div className="artwork" dangerouslySetInnerHTML={{ __html: art }} />
-              {bounds && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }} />}
-            </div>
+            <Menu open={contextOpen} onOpenChange={setContextOpen} onAction={layerAction}>
+              <MenuContextTrigger ref={artboard} className={`artboard ${tool === 'select' ? 'selectable-artboard' : ''}`}
+                style={{ height: scene.height * scale }} tabIndex={0} aria-label="Editable artboard" aria-describedby="canvas-keyboard-help"
+                onPointerDown={canvasPointerDown} onPointerMove={interaction.move} onPointerUp={() => void interaction.finish()}
+                onPointerCancel={() => interaction.cancel()} onLostPointerCapture={interaction.release} onDoubleClick={canvasDoubleClick}
+                onKeyDown={(event) => {
+                  if (!isTextInput(event.target) && ((event.shiftKey && event.key === 'F10') || event.key === 'ContextMenu')) {
+                    event.preventDefault(); event.stopPropagation();
+                    event.currentTarget.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 0 }));
+                  }
+                }}
+                onContextMenuCapture={(event) => {
+                  if (isTextInput(event.target)) { event.stopPropagation(); return; }
+                  const layer = layerAt(event.target);
+                  if (layer) { setSelected(layer.id); setInspector('properties'); }
+                  else if (event.clientX || event.clientY) setSelected(undefined);
+                }}>
+                <div className="artwork" dangerouslySetInnerHTML={{ __html: art }} />
+                {bounds && <div className="selection-box" style={{ left: bounds.x * scale, top: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale }}>
+                  {!interaction.editing && !selectedLayer?.rotationDeg && tool === 'select' && (['nw', 'ne', 'se', 'sw'] as const).map((corner) =>
+                    <button key={corner} type="button" className={`resize-handle handle-${corner}`} data-resize-handle={corner}
+                      aria-label={`Resize ${corner === 'nw' ? 'top left' : corner === 'ne' ? 'top right' : corner === 'se' ? 'bottom right' : 'bottom left'}`}
+                      disabled={working || !revision} onPointerDown={(event) => {
+                        event.stopPropagation(); if (selectedLayer) interaction.begin(event, selectedLayer, corner);
+                      }} />)}
+                </div>}
+                {interaction.editing && <div className="canvas-text-editor" data-canvas-editor="true" role="group" aria-label="Canvas text editor"
+                  style={{ left: Math.max(0, Math.min((bounds?.x ?? 0) * scale, scene.width * scale - 250)),
+                    top: Math.max(0, Math.min((bounds?.y ?? 0) * scale, scene.height * scale - 160)) }}>
+                  <textarea ref={textInput} aria-label="Edit text on canvas" maxLength={10000} value={interaction.editing.value}
+                    disabled={working} onChange={(event) => interaction.changeText(event.target.value)} onKeyDown={(event) => {
+                      event.stopPropagation();
+                      if (event.key === 'Escape') { event.preventDefault(); interaction.cancel(); artboard.current?.focus(); }
+                      if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                        event.preventDefault(); void interaction.saveText().then((saved) => { if (saved) artboard.current?.focus(); });
+                      }
+                    }} />
+                  <div><small>{interaction.editing.conflict ? 'Document changed. Copy your draft, then cancel and reopen.' : 'Enter saves · Shift + Enter adds a line'}</small><span>
+                    <Button type="button" disabled={working} onClick={() => { interaction.cancel(); artboard.current?.focus(); }}>Cancel</Button>
+                    <Button type="button" disabled={working || interaction.editing.conflict} onClick={() => void interaction.saveText().then((saved) => { if (saved) artboard.current?.focus(); })}>Save</Button>
+                  </span></div>
+                </div>}
+              </MenuContextTrigger>
+              <MenuContent className="pop-menu canvas-context-menu" aria-label="Selection actions" sideOffset={4} finalFocus={() => artboard.current}>
+                <div className="menu-caption">{selectedLayer?.name ?? 'Select an element'}</div>
+                <MenuItem value="text" label="Edit text" disabled={working || selectedLayer?.kind !== 'text'}><Type size={14} /> Edit text</MenuItem>
+                <MenuItem value="duplicate" label="Duplicate" shortcut="mod+d" disabled={working || !selectedLayer}><Copy size={14} /> Duplicate</MenuItem>
+                <MenuItem value="front" label="Bring to front" disabled={working || !selectedLayer}>Bring to front</MenuItem>
+                <MenuItem value="back" label="Send to back" disabled={working || !selectedLayer}>Send to back</MenuItem>
+                <MenuSeparator className="context-separator" />
+                <MenuItem value="agent" label="Ask agent about selection" disabled={!selectedLayer}><Sparkles size={14} /> Ask agent about selection</MenuItem>
+                <MenuItem value="delete" label="Delete" shortcut="Delete" destructive disabled={working || !selectedLayer}>Delete</MenuItem>
+              </MenuContent>
+            </Menu>
           </div>}
           {mode === 'mesh' && <Suspense fallback={<div className="view-loading">Opening 3D view…</div>}><MeshPreview scene={scene} /></Suspense>}
           {mode === 'source' && <div className="source-view">
@@ -624,6 +734,7 @@ export function App() {
             <IconButton label="Zoom in" onClick={() => setZoom((value) => Math.min(4, value * 1.2))}><Plus size={15} /></IconButton>
           </div>}
           {!revision && <div className="document-loading" role="status">Opening document…</div>}
+          <p id="canvas-keyboard-help" className="sr-only">Drag an element to move it. Double-click text to edit it. Arrow keys move by one pixel; Shift and arrow keys move by ten. Escape cancels. Right-click or Shift F10 opens selection actions.</p>
           {notice && <div className={`toast ${notice.error ? 'toast-error' : ''}`} role={notice.error ? 'alert' : 'status'}>
             {notice.error ? <CircleAlert size={16} /> : <CircleCheck size={16} />}<span>{notice.message}</span>
           </div>}
@@ -644,6 +755,8 @@ export function App() {
             {['Verify the canvas', 'Fix the current issues', 'Render this document'].map((prompt) =>
               <button key={prompt} onClick={() => runPrompt(prompt)} disabled={running || !revision}>{prompt}</button>)}
           </div>
+          {selectedLayer && <div className="selection-context"><Crosshair size={12} /><span>Selected: {selectedLayer.name}</span>
+            <button type="button" aria-label="Remove selection context" onClick={() => setSelected(undefined)}><X size={12} /></button></div>}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); runPrompt(brief); }}>
             <textarea ref={consoleInput} value={brief} maxLength={4000} aria-label="Agent brief" placeholder="Describe a change or enter a command…"
               onChange={(event) => setBrief(event.target.value)}
@@ -734,6 +847,16 @@ export function App() {
                 if (Number.isFinite(value) && value !== selectedLayer[axis]) void patchLayer(selectedLayer, { [axis]: value });
               }} /></label>)}
             </div>}
+            {'width' in selectedLayer && 'height' in selectedLayer && <div className="property-grid">
+              {(['width', 'height'] as const).map((dimension) => <label key={dimension}>{dimension === 'width' ? 'Width' : 'Height'}<input type="number" min="1" step="1" defaultValue={selectedLayer[dimension]} onBlur={(event) => {
+                const value = event.target.valueAsNumber;
+                if (Number.isFinite(value) && value > 0 && value !== selectedLayer[dimension]) void patchLayer(selectedLayer, { [dimension]: value });
+              }} /></label>)}
+            </div>}
+            {selectedLayer.kind === 'text' && <label>Font size<input type="number" min="1" step="1" defaultValue={selectedLayer.fontSize} onBlur={(event) => {
+              const value = event.target.valueAsNumber;
+              if (Number.isFinite(value) && value > 0 && value !== selectedLayer.fontSize) void patchLayer(selectedLayer, { fontSize: value });
+            }} /></label>}
             {'fill' in selectedLayer && <label>Fill<input defaultValue={selectedLayer.fill} onBlur={(event) => {
               if (event.target.value !== selectedLayer.fill) void patchLayer(selectedLayer, { fill: event.target.value });
             }} /></label>}

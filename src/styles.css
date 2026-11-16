@@ -24,6 +24,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 button { -webkit-tap-highlight-color: transparent; }
 svg { flex-shrink: 0; vertical-align: middle; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 strong { font-weight: 650; }
 
 .studio { display: flex; flex-direction: column; width: 100%; height: 100dvh; min-height: 530px; }
@@ -159,11 +160,29 @@ strong { font-weight: 650; }
 .artwork, .artwork > svg { width: 100%; height: 100%; display: block; }
 .artwork { overflow: hidden; }
 .selection-box { outline: 1px solid #4b72de; box-shadow: inset 0 0 0 1px #e6edff60; position: absolute; pointer-events: none; }
-.selection-box::before, .selection-box::after {
-  content: ''; width: 5px; height: 5px; background: white; border: 1px solid #4b72de; position: absolute;
-}
-.selection-box::before { top: -3px; left: -3px; }
-.selection-box::after { bottom: -3px; right: -3px; }
+.selectable-artboard { touch-action: none; user-select: none; }
+.selectable-artboard [data-layer-id] { cursor: move; }
+.artwork [data-layer-kind="text"] { pointer-events: bounding-box; }
+.resize-handle { position: absolute; width: 9px; height: 9px; padding: 0; border: 1px solid #4b72de; border-radius: 1px; background: white; pointer-events: auto; }
+.handle-nw { top: -5px; left: -5px; cursor: nwse-resize; }
+.handle-ne { top: -5px; right: -5px; cursor: nesw-resize; }
+.handle-se { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.handle-sw { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.canvas-context-menu { min-width: 220px; }
+.canvas-context-menu [role="menuitem"] { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 5px; font-size: 12px; }
+.canvas-context-menu [role="menuitem"]:not([data-disabled]):is(:hover, [data-highlighted]) { background: #f3f2ed; }
+.canvas-context-menu [data-destructive] { color: #a04532; }
+.canvas-context-menu .menu-caption { max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.context-separator { height: 1px; background: var(--line); margin: 4px 0; }
+.canvas-text-editor { position: absolute; z-index: 3; width: 270px; padding: 8px; border: 1px solid #8eabe5; border-radius: 7px; background: #fffefa; box-shadow: 0 8px 28px #202a4528; user-select: text; }
+.canvas-text-editor textarea { width: 100%; min-height: 84px; max-height: 250px; resize: vertical; border: 1px solid #d6dbe5; border-radius: 4px; padding: 8px; background: white; font-size: 14px; line-height: 1.5; }
+.canvas-text-editor > div { display: flex; flex-direction: column; gap: 7px; margin-top: 6px; }
+.canvas-text-editor small { color: var(--muted); font-size: 10px; }
+.canvas-text-editor > div > span { display: flex; justify-content: flex-end; gap: 5px; }
+.canvas-text-editor button { border: 1px solid var(--line); border-radius: 4px; background: #f5f4ed; padding: 4px 9px; font-size: 11px; }
+.selection-context { display: flex; align-items: center; gap: 6px; margin: 0 16px 7px; color: #6e5426; font-size: 11px; }
+.selection-context > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.selection-context button { display: grid; place-items: center; border: 0; background: #f4ead3; color: #6e5426; padding: 3px; border-radius: 4px; }
 .zoom-widget {
   display: flex; align-items: center; gap: 2px; position: absolute; bottom: 15px; left: 50%; transform: translateX(-50%);
   background: #fdfdfa; border: 1px solid #deddd5; padding: 3px; border-radius: 8px; box-shadow: 0 3px 7px #32312613;

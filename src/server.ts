@@ -20,6 +20,7 @@ import { figureExamples } from './figure-examples.ts';
 import { plotExamples } from './plot-examples.ts';
 import { fontCatalog } from './font-catalog.ts';
 import { createInput, diagramInput, exportInput, plotInput, restoreInput } from './workspace-client.ts';
+import { chatSelectionContext, chatSelectionPrompt, InvalidSelectionError, selectedLayerIdsSchema } from './chat-context.ts';
 
 const revisionInput = z.number().int().positive().optional();
 const targetFields = { documentId: z.string().uuid().optional(), revision: revisionInput };
@@ -177,6 +178,7 @@ export function workspaceMiddleware(env: Record<string, string | undefined>) {
       role: z.enum(['user', 'assistant', 'system']),
       parts: z.array(z.object({ type: z.string(), text: z.string().optional() })),
     })).max(60),
+    selectedLayerIds: selectedLayerIdsSchema,
     ...targetFields,
   });
   const presets: Record<string, string> = {
@@ -189,7 +191,7 @@ export function workspaceMiddleware(env: Record<string, string | undefined>) {
 
   function chat(input: z.infer<typeof promptInput>, signal: AbortSignal) {
     const documentId = input.documentId || store.defaultDocumentId;
-    store.get(documentId);
+    const selection = chatSelectionContext(store.get(documentId), input.selectedLayerIds);
     const brief = input.messages.findLast((message) => message.role === 'user')
       ?.parts.filter((part) => part.type === 'text').map((part) => part.text).join(' ').trim();
     if (!brief || brief.length > 4000) throw new RequestError(400, 'Enter a brief of up to 4,000 characters.');
@@ -205,17 +207,18 @@ export function workspaceMiddleware(env: Record<string, string | undefined>) {
       });
       const result = streamText({
         model: gateway(env.GRAPHER_MODEL || 'openai/gpt-5-mini'),
-        system: 'You create polished editable figures in Grapher. Inspect before changing a document. Use compose_diagram for automatic layout of connected nodes and labeled edges. Use compose_plot for line, scatter and bar figures from user-supplied numeric data, including supplied uncertainty intervals. Never infer an interval or fabricate scientific data, claims, or citations. Ask for missing data. Use native vector operations for precise refinement. Bundled fonts are Source Sans 3 (supports Greek), Barlow, Crimson Text, and Courier Prime. Text supports maxWidth wrapping, lineHeight, and letterSpacing. Paths support arrows and dashes, shapes support strokes, opacity, rotationDeg and gradient paints. Use a restrained palette, measured typography and clear hierarchy. Verify after editing and review the rendered PNG. Correct defects you can substantiate. Describe unresolved warnings. Pass the latest revision to every edit. Keep responses concise.',
+        system: 'You create polished editable figures in Grapher. Inspect before changing a document. Use compose_diagram for automatic layout of connected nodes and labeled edges. Use compose_plot for line, scatter and bar figures from user-supplied numeric data, including supplied uncertainty intervals. Never infer an interval or fabricate scientific data, claims, or citations. Ask for missing data. Use native vector operations for precise refinement. Bundled fonts are Source Sans 3 (supports Greek), Barlow, Crimson Text, and Courier Prime. Text supports maxWidth wrapping, lineHeight, and letterSpacing. Paths support arrows and dashes, shapes support strokes, opacity, rotationDeg and gradient paints. Use a restrained palette, measured typography and clear hierarchy. Verify after editing and review the rendered PNG. Correct defects you can substantiate. Describe unresolved warnings. Pass the latest revision to every edit. Keep responses concise. '
+          + chatSelectionPrompt(selection),
         messages: history,
         abortSignal: signal,
         stopWhen: stepCountIs(12),
         tools: {
           inspect: tool({
-            description: 'Inspect editable content, saved document ID, revision and checks.',
+            description: 'Inspect editable content, saved document ID, revision, checks, and selected layer IDs and names captured when the human submitted this request.',
             inputSchema: z.object({}),
             execute: async () => {
               const state = await snapshot(documentId);
-              return { ...state, scene: { ...state.scene, layers: state.scene.layers.map((layer) =>
+              return { ...state, selection, scene: { ...state.scene, layers: state.scene.layers.map((layer) =>
                 layer.kind === 'raster' ? { ...layer, src: '(embedded image preserved in document)' } : layer) } };
             },
           }),
@@ -420,7 +423,8 @@ export function workspaceMiddleware(env: Record<string, string | undefined>) {
     if (!req.url?.startsWith('/api/')) return next();
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) return res.end();
-      const status = error instanceof RequestError || error instanceof StoreError ? error.status : error instanceof z.ZodError ? 400 : 422;
+      const status = error instanceof RequestError || error instanceof StoreError ? error.status
+        : error instanceof z.ZodError || error instanceof InvalidSelectionError ? 400 : 422;
       const message = error instanceof z.ZodError
         ? error.issues.map((issue) => issue.path.join('.') + ' — ' + issue.message).join('; ')
         : error instanceof Error ? error.message : 'Workspace request failed.';
